@@ -8,7 +8,7 @@
 
 use super::db_to_linear;
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::smoothing::Smoothed;
 use crate::transport::ProcessContext;
 
@@ -80,8 +80,18 @@ impl Processor for Compressor {
 
     /// threshold dB; ratio (4 = 4:1); attack/release in ms; knee dB;
     /// makeup gain dB.
-    fn params(&self) -> &'static [&'static str] {
-        &["threshold", "ratio", "attack", "release", "knee", "makeup"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[
+                ParamInfo::linear("threshold", -60.0, 0.0, -18.0, "dB"),
+                ParamInfo::log("ratio", 1.0, 100.0, 4.0, ":1"),
+                ParamInfo::log("attack", 0.01, 500.0, 10.0, "ms"),
+                ParamInfo::log("release", 1.0, 5_000.0, 100.0, "ms"),
+                ParamInfo::linear("knee", 0.0, 24.0, 6.0, "dB"),
+                ParamInfo::linear("makeup", -24.0, 24.0, 0.0, "dB"),
+            ];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {
@@ -112,14 +122,31 @@ impl Processor for Compressor {
     }
 
     fn process(&mut self, buffer: &mut AudioBuffer, _ctx: &ProcessContext) {
+        self.run(buffer, None);
+    }
+
+    /// With a sidechain, the DETECTOR listens to the key while the GAIN
+    /// still applies to this track: the kick hits, the bass ducks.
+    fn process_keyed(&mut self, buffer: &mut AudioBuffer, _ctx: &ProcessContext, key: Option<&AudioBuffer>) {
+        let key = key.filter(|k| k.channels() >= 2 && k.frames() == buffer.frames());
+        self.run(buffer, key.map(|k| k.stereo()));
+    }
+}
+
+impl Compressor {
+    fn run(&mut self, buffer: &mut AudioBuffer, key: Option<(&[f32], &[f32])>) {
         if buffer.channels() < 2 {
             return;
         }
         let (l, r) = buffer.stereo_mut();
-        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+        for (i, (a, b)) in l.iter_mut().zip(r.iter_mut()).enumerate() {
             // Stereo-linked detection: both channels get the same gain, so
             // compressing a hit on one side doesn't shift the stereo image.
-            let level = a.abs().max(b.abs()).max(1e-6); // floor at -120 dB
+            let level = match key {
+                Some((kl, kr)) => kl[i].abs().max(kr[i].abs()),
+                None => a.abs().max(b.abs()),
+            }
+            .max(1e-6); // floor at -120 dB
             let x_db = 20.0 * level.log10();
             let target = self.curve(x_db) - x_db; // 0 or negative
 

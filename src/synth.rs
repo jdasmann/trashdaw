@@ -2,8 +2,8 @@
 //! ADSR envelopes, and voice allocation.
 
 use crate::buffer::AudioBuffer;
-use crate::midi::{MidiEvent, MidiMessage};
-use crate::processor::{Instrument, PrepareInfo};
+use crate::midi::{MidiEvent, MidiMessage, SUSTAIN_PEDAL};
+use crate::processor::{Instrument, ParamInfo, PrepareInfo};
 use crate::smoothing::Smoothed;
 use crate::transport::ProcessContext;
 use std::f32::consts::TAU;
@@ -39,6 +39,60 @@ struct Voice {
     release_step: f32,
     /// When it was started, for "steal the oldest".
     started: u64,
+    /// The voice's own filter: coefficients and the two state values.
+    filter: Svf,
+}
+
+/// A state-variable lowpass in "topology-preserving transform" form (after
+/// Vadim Zavalishin and Andrew Simper). Unlike a biquad, its cutoff can be
+/// modulated constantly, on every voice, without instability or zipper
+/// noise, which is exactly what a filter envelope does.
+#[derive(Clone, Copy)]
+struct Svf {
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    ic1: f32,
+    ic2: f32,
+}
+
+impl Svf {
+    const IDLE: Svf = Svf { a1: 1.0, a2: 0.0, a3: 0.0, ic1: 0.0, ic2: 0.0 };
+
+    /// `g` is the pre-warped cutoff (tan(π·fc/sr)), `k` the damping
+    /// (2 = no resonance, near 0 = ringing).
+    #[inline(always)]
+    fn set(&mut self, g: f32, k: f32) {
+        self.a1 = 1.0 / (1.0 + g * (g + k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+    }
+
+    #[inline(always)]
+    fn lowpass(&mut self, x: f32) -> f32 {
+        let v3 = x - self.ic2;
+        let v1 = self.a1 * self.ic1 + self.a2 * v3;
+        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
+        self.ic1 = 2.0 * v1 - self.ic1;
+        self.ic2 = 2.0 * v2 - self.ic2;
+        v2
+    }
+}
+
+/// The cutoff parameter's top value, which means "filter off".
+const CUTOFF_OFF: f32 = 20_000.0;
+
+/// Recompute each voice's filter coefficients this often while its
+/// envelope moves: tan() per sample per voice would be wasteful.
+const FILTER_CONTROL_RATE: usize = 16;
+
+/// Per-block filter settings shared by every voice.
+struct FilterSettings {
+    cutoff: f32,
+    env_octaves: f32,
+    k: f32,
+    max_cutoff: f32,
+    pi_over_sr: f32,
 }
 
 impl Voice {
@@ -51,6 +105,7 @@ impl Voice {
         level: 0.0,
         release_step: 0.0,
         started: 0,
+        filter: Svf::IDLE,
     };
 }
 
@@ -116,9 +171,20 @@ struct Envelope {
 
 /// Runs one voice over `mix`, adding into it. `osc(phase, dt)` is the
 /// waveform; being a generic closure, it is inlined into this loop.
+/// `FILTERED` is a const generic, so the compiler builds two versions of
+/// this loop: one with the filter and one without. With a runtime check in
+/// here instead, unfiltered sine and square voices measured 12-18% slower,
+/// even though the branch always went the same way: it kept the loop from
+/// being optimized as tightly.
 #[inline(always)]
-fn run_voice(v: &mut Voice, env: &Envelope, mix: &mut [f32], osc: impl Fn(f32, f32) -> f32) {
-    for out in mix.iter_mut() {
+fn run_voice<const FILTERED: bool>(
+    v: &mut Voice,
+    env: &Envelope,
+    filter: &FilterSettings,
+    mix: &mut [f32],
+    osc: impl Fn(f32, f32) -> f32,
+) {
+    for (i, out) in mix.iter_mut().enumerate() {
         match v.stage {
             Stage::Idle => return,
             Stage::Attack => {
@@ -144,7 +210,18 @@ fn run_voice(v: &mut Voice, env: &Envelope, mix: &mut [f32], osc: impl Fn(f32, f
                 }
             }
         }
-        *out += osc(v.phase, v.inc) * v.level * v.velocity;
+        let mut s = osc(v.phase, v.inc);
+        if FILTERED {
+            let f = filter;
+            if i % FILTER_CONTROL_RATE == 0 {
+                // The voice's own envelope opens the filter: at full level
+                // the cutoff is `env_octaves` above the base cutoff.
+                let fc = (f.cutoff * (f.env_octaves * v.level).exp2()).min(f.max_cutoff);
+                v.filter.set((fc * f.pi_over_sr).tan(), f.k);
+            }
+            s = v.filter.lowpass(s);
+        }
+        *out += s * v.level * v.velocity;
         v.phase += v.inc;
         if v.phase >= 1.0 {
             v.phase -= 1.0;
@@ -164,6 +241,14 @@ pub struct Synth {
     release: f32,
     level: Smoothed,
     counter: u64,
+    cutoff: f32,
+    env_octaves: f32,
+    resonance: f32,
+    /// Sustain pedal down?
+    pedal: bool,
+    /// Notes whose key was released while the pedal was down: they keep
+    /// ringing until the pedal comes up.
+    sustained: [bool; 128],
 }
 
 impl Synth {
@@ -181,10 +266,17 @@ impl Synth {
             release: 0.3,
             level,
             counter: 0,
+            cutoff: 20_000.0,
+            env_octaves: 0.0,
+            resonance: 0.0,
+            pedal: false,
+            sustained: [false; 128],
         }
     }
 
     fn note_on(&mut self, note: u8, velocity: u8) {
+        // Played again: the key holds it now, not the pedal.
+        self.sustained[note as usize] = false;
         self.counter += 1;
         let freq = 440.0 * 2f32.powf((note as f32 - 69.0) / 12.0);
 
@@ -209,6 +301,7 @@ impl Synth {
         if v.stage == Stage::Idle {
             v.phase = 0.0;
             v.level = 0.0;
+            v.filter = Svf::IDLE;
         }
         // A retriggered or stolen voice keeps its phase and attacks from
         // its current level, so the waveform doesn't jump.
@@ -219,7 +312,32 @@ impl Synth {
         v.started = self.counter;
     }
 
+    /// A key was released. With the pedal down, the note keeps ringing.
     fn note_off(&mut self, note: u8) {
+        if self.pedal {
+            if self.voices.iter().any(|v| v.note == note && !matches!(v.stage, Stage::Idle | Stage::Release)) {
+                self.sustained[note as usize] = true;
+            }
+            return;
+        }
+        self.release(note);
+    }
+
+    fn pedal_changed(&mut self, value: u8) {
+        let down = value >= 64; // the MIDI convention for on/off controllers
+        if self.pedal && !down {
+            for note in 0..128u8 {
+                if self.sustained[note as usize] {
+                    self.sustained[note as usize] = false;
+                    self.release(note);
+                }
+            }
+        }
+        self.pedal = down;
+    }
+
+    /// Starts the release of every voice playing `note`.
+    fn release(&mut self, note: u8) {
         let release_samples = self.release.max(0.001) * self.sample_rate;
         for v in &mut self.voices {
             if v.note == note && !matches!(v.stage, Stage::Idle | Stage::Release) {
@@ -254,6 +372,8 @@ impl Synth {
 
     fn render_chunk(&mut self, buffer: &mut AudioBuffer, from: usize, to: usize) {
         let n = to - from;
+        // Decided before borrowing `self.mix` below.
+        let filter_on = self.filter_active();
         let Some(mix) = self.mix.get_mut(..n) else { return };
         mix.fill(0.0);
 
@@ -262,12 +382,26 @@ impl Synth {
             decay_step: (1.0 - self.sustain) / (self.decay.max(0.001) * self.sample_rate),
             sustain: self.sustain,
         };
+        let max_cutoff = self.sample_rate * 0.45;
+        let settings = FilterSettings {
+            cutoff: self.cutoff.min(max_cutoff),
+            env_octaves: self.env_octaves,
+            // Resonance 0..1 -> damping 2..0.04 (Q from 0.5 to 25).
+            k: 2.0 * (1.0 - 0.98 * self.resonance),
+            max_cutoff,
+            pi_over_sr: std::f32::consts::PI / self.sample_rate,
+        };
+        let f = &settings;
         for v in self.voices.iter_mut().filter(|v| v.stage != Stage::Idle) {
-            // Monomorphized per waveform: the match happens here, once.
-            match self.wave {
-                Wave::Sine => run_voice(v, &env, mix, |p, _| fast_sin_turns(p)),
-                Wave::Saw => run_voice(v, &env, mix, |p, dt| oscillator(Wave::Saw, p, dt)),
-                Wave::Square => run_voice(v, &env, mix, |p, dt| oscillator(Wave::Square, p, dt)),
+            // Monomorphized per waveform AND per filter on/off: the choice
+            // is made here, once per voice, never inside the sample loop.
+            match (self.wave, filter_on) {
+                (Wave::Sine, false) => run_voice::<false>(v, &env, f, mix, |p, _| fast_sin_turns(p)),
+                (Wave::Sine, true) => run_voice::<true>(v, &env, f, mix, |p, _| fast_sin_turns(p)),
+                (Wave::Saw, false) => run_voice::<false>(v, &env, f, mix, |p, dt| oscillator(Wave::Saw, p, dt)),
+                (Wave::Saw, true) => run_voice::<true>(v, &env, f, mix, |p, dt| oscillator(Wave::Saw, p, dt)),
+                (Wave::Square, false) => run_voice::<false>(v, &env, f, mix, |p, dt| oscillator(Wave::Square, p, dt)),
+                (Wave::Square, true) => run_voice::<true>(v, &env, f, mix, |p, dt| oscillator(Wave::Square, p, dt)),
             }
         }
 
@@ -277,6 +411,14 @@ impl Synth {
             *l += s;
             *r += s;
         }
+    }
+
+    /// The filter is off at its top cutoff with no envelope: then every
+    /// voice skips it, and the synth sounds exactly as it did before it had
+    /// a filter. (Not "at or above 0.45 x sample rate": at 48 kHz that's
+    /// 21.6 kHz, above the 20 kHz default, so the filter would always run.)
+    fn filter_active(&self) -> bool {
+        self.cutoff < CUTOFF_OFF || self.env_octaves > 0.0
     }
 
     #[cfg(test)]
@@ -290,8 +432,21 @@ impl Instrument for Synth {
         "synth"
     }
 
-    fn params(&self) -> &'static [&'static str] {
-        &["wave", "attack", "decay", "sustain", "release", "level"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[
+                ParamInfo::int("wave", 0.0, 2.0, 1.0), // sine, saw, square
+                ParamInfo::log("attack", 0.001, 10.0, 0.005, "s"),
+                ParamInfo::log("decay", 0.001, 10.0, 0.2, "s"),
+                ParamInfo::linear("sustain", 0.0, 1.0, 0.6, ""),
+                ParamInfo::log("release", 0.001, 10.0, 0.3, "s"),
+                ParamInfo::linear("level", 0.0, 1.0, 0.2, ""),
+                ParamInfo::log("cutoff", 20.0, 20_000.0, 20_000.0, "Hz"),
+                ParamInfo::linear("env_amount", 0.0, 10.0, 0.0, "oct"),
+                ParamInfo::linear("resonance", 0.0, 1.0, 0.0, ""),
+            ];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {
@@ -315,6 +470,11 @@ impl Instrument for Synth {
             3 => self.sustain = value.clamp(0.0, 1.0),
             4 => self.release = value.clamp(0.0, 10.0),
             5 => self.level.set(value.clamp(0.0, 1.0)),
+            // Filter: base cutoff in Hz (20000 = off), envelope amount in
+            // octaves, resonance 0..1.
+            6 => self.cutoff = value.clamp(20.0, CUTOFF_OFF),
+            7 => self.env_octaves = value.clamp(0.0, 10.0),
+            8 => self.resonance = value.clamp(0.0, 1.0),
             _ => {}
         }
     }
@@ -330,6 +490,12 @@ impl Instrument for Synth {
             match ev.msg {
                 MidiMessage::NoteOn { note, velocity } => self.note_on(note, velocity),
                 MidiMessage::NoteOff { note } => self.note_off(note),
+                MidiMessage::ForceOff { note } => {
+                    self.sustained[note as usize] = false;
+                    self.release(note);
+                }
+                MidiMessage::ControlChange { controller: SUSTAIN_PEDAL, value } => self.pedal_changed(value),
+                MidiMessage::ControlChange { .. } => {}
             }
         }
         self.render_span(buffer, cursor, n);
@@ -438,5 +604,138 @@ mod tests {
             let half = if half >= 1.0 { half - 1.0 } else { half };
             assert_eq!(half, (p + 0.5) % 1.0);
         }
+    }
+
+    // ---- Step 7 exercise 3: sustain pedal ----
+
+    fn pedal(frame: usize, down: bool) -> MidiEvent {
+        MidiEvent { frame, msg: MidiMessage::ControlChange { controller: 64, value: if down { 127 } else { 0 } } }
+    }
+
+    fn releasing(s: &Synth, note: u8) -> bool {
+        s.voices.iter().any(|v| v.note == note && v.stage == Stage::Release)
+    }
+
+    #[test]
+    fn pedal_holds_released_keys_until_it_lifts() {
+        let mut s = synth();
+        run(&mut s, 512, &[pedal(0, true), on(10, 60), off(100, 60)]);
+        assert_eq!(s.sounding(), 1);
+        assert!(!releasing(&s, 60), "key up, pedal down: still sustaining");
+        run(&mut s, 512, &[pedal(0, false)]);
+        assert!(releasing(&s, 60), "pedal up: now it releases");
+    }
+
+    #[test]
+    fn replaying_a_sustained_note_then_releasing_it() {
+        let mut s = synth();
+        run(&mut s, 512, &[pedal(0, true), on(0, 60), off(50, 60), on(100, 60), off(200, 60)]);
+        assert!(!releasing(&s, 60));
+        run(&mut s, 512, &[pedal(0, false)]);
+        assert!(releasing(&s, 60));
+    }
+
+    #[test]
+    fn force_off_ignores_the_pedal() {
+        // What the sequencer sends when you seek while the pedal is held:
+        // the old notes must stop, not ring on under the new position.
+        let mut s = synth();
+        run(&mut s, 512, &[pedal(0, true), on(0, 60), on(0, 64)]);
+        run(&mut s, 512, &[MidiEvent { frame: 0, msg: MidiMessage::ForceOff { note: 60 } }]);
+        assert!(releasing(&s, 60), "forced off despite the pedal");
+        assert!(!releasing(&s, 64), "other notes unaffected");
+        // And it doesn't come back to life when the pedal lifts later.
+        run(&mut s, 48_000, &[]);
+        run(&mut s, 512, &[pedal(0, false)]);
+        assert!(s.voices.iter().all(|v| v.note != 60 || v.stage == Stage::Idle));
+    }
+
+    #[test]
+    fn other_controllers_are_ignored() {
+        let mut s = synth();
+        let cc = MidiEvent { frame: 0, msg: MidiMessage::ControlChange { controller: 1, value: 127 } };
+        run(&mut s, 512, &[cc, on(0, 60), off(100, 60)]);
+        assert!(releasing(&s, 60), "mod wheel isn't a sustain pedal");
+    }
+
+    // ---- Step 7 exercise 2: a filter per voice ----
+
+    fn held_note(s: &mut Synth, note: u8, frames: usize) -> Vec<f32> {
+        run(s, frames, &[on(0, note)])
+    }
+
+    #[test]
+    fn filter_is_off_by_default() {
+        // Regression: an earlier version compared two synths that were
+        // BOTH filtered, so it passed while the default sound had changed.
+        // The heavy benchmark's reference render caught it.
+        let mut s = synth();
+        assert!(!s.filter_active());
+        s.set_param(6, 19_000.0);
+        assert!(s.filter_active());
+        s.set_param(6, 20_000.0);
+        s.set_param(7, 1.0);
+        assert!(s.filter_active(), "the envelope alone turns it on");
+        s.set_param(7, 0.0);
+        assert!(!s.filter_active());
+    }
+
+    #[test]
+    fn lowpass_darkens_the_saw() {
+        // A 220 Hz saw: its 20th harmonic is 4400 Hz.
+        let mut open = synth();
+        let mut closed = synth();
+        closed.set_param(6, 500.0);
+        let a = held_note(&mut open, 57, 48_000);
+        let b = held_note(&mut closed, 57, 48_000);
+        let (ha, hb) = (goertzel(&a[24_000..], 4_400.0), goertzel(&b[24_000..], 4_400.0));
+        // A two-pole lowpass falls 12 dB per octave; 4400 Hz is 3.14
+        // octaves above 500 Hz, so expect about -37.7 dB.
+        let db = 20.0 * (hb / ha).log10();
+        let expected = -12.0 * (4_400.0f32 / 500.0).log2();
+        assert!((db - expected).abs() < 2.0, "20th harmonic: {db:.1} dB, expected about {expected:.1}");
+        // The fundamental passes nearly untouched.
+        let (fa, fb) = (goertzel(&a[24_000..], 220.0), goertzel(&b[24_000..], 220.0));
+        assert!(fb > fa * 0.8, "fundamental: open {fa:.4}, filtered {fb:.4}");
+    }
+
+    #[test]
+    fn filter_envelope_opens_then_closes() {
+        // Low base cutoff, 5 octaves of envelope, a short decay to a low
+        // sustain: bright at the start of the note, dark later.
+        let mut s = synth();
+        s.set_param(6, 200.0);
+        s.set_param(7, 5.0);
+        s.set_param(2, 0.2); // decay 200 ms
+        s.set_param(3, 0.1); // sustain
+        let out = held_note(&mut s, 45, 48_000);
+        let harmonic = 110.0 * 20.0; // 2.2 kHz
+        let early = goertzel(&out[240..2_640], harmonic); // 5-55 ms
+        let late = goertzel(&out[40_000..42_400], harmonic);
+        assert!(early > 20.0 * late, "early {early:.5}, late {late:.6}");
+    }
+
+    #[test]
+    fn resonance_boosts_the_cutoff_region_and_stays_stable() {
+        let mut flat = synth();
+        let mut res = synth();
+        for s in [&mut flat, &mut res] {
+            s.set_param(6, 880.0); // the 8th harmonic of a 110 Hz saw
+        }
+        res.set_param(8, 0.95);
+        let a = held_note(&mut flat, 45, 48_000);
+        let b = held_note(&mut res, 45, 48_000);
+        assert!(goertzel(&b[24_000..], 880.0) > 3.0 * goertzel(&a[24_000..], 880.0));
+        assert!(b.iter().all(|x| x.is_finite() && x.abs() < 10.0));
+
+        // Full resonance with the envelope sweeping the cutoff hard.
+        let mut wild = synth();
+        wild.set_param(6, 50.0);
+        wild.set_param(7, 9.0);
+        wild.set_param(8, 1.0);
+        wild.set_param(2, 0.05);
+        let events: Vec<_> = (0..16).map(|k| on(k * 300, 30 + k as u8 * 5)).collect();
+        let out = run(&mut wild, 48_000, &events);
+        assert!(out.iter().all(|x| x.is_finite() && x.abs() < 10.0), "unstable");
     }
 }

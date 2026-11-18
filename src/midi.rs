@@ -7,17 +7,27 @@ use std::time::Instant;
 pub enum MidiMessage {
     NoteOn { note: u8, velocity: u8 },
     NoteOff { note: u8 },
+    /// A controller (knob, fader, pedal). 64 is the sustain pedal.
+    ControlChange { controller: u8, value: u8 },
+    /// Stop this note NOW, even if the sustain pedal is down. Sent when
+    /// time jumps or a track is disarmed: clean-up, not a musical note-off.
+    /// It never comes from a device; it's ours.
+    ForceOff { note: u8 },
 }
 
+/// The sustain pedal's controller number.
+pub const SUSTAIN_PEDAL: u8 = 64;
+
 impl MidiMessage {
-    /// Parses raw bytes from a MIDI device. Everything except notes
-    /// (controllers, pitch bend, clock...) is ignored for now.
+    /// Parses raw bytes from a MIDI device. Notes and controllers are
+    /// understood; everything else (pitch bend, clock...) is ignored.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let (&status, rest) = bytes.split_first()?;
         match (status & 0xF0, rest) {
             // A note-on with velocity 0 means note-off (running status trick).
             (0x90, [note, 0, ..]) | (0x80, [note, _, ..]) => Some(Self::NoteOff { note: note & 0x7F }),
             (0x90, [note, velocity, ..]) => Some(Self::NoteOn { note: note & 0x7F, velocity: velocity & 0x7F }),
+            (0xB0, [controller, value, ..]) => Some(Self::ControlChange { controller: controller & 0x7F, value: value & 0x7F }),
             _ => None,
         }
     }
@@ -32,8 +42,9 @@ pub struct MidiEvent {
 }
 
 impl MidiEvent {
-    /// Sort key: by time, and note-offs before note-ons at the same frame,
-    /// so a repeated note releases before it retriggers.
+    /// Sort key: by time, and everything else (offs, pedal) before
+    /// note-ons at the same frame, so a repeated note releases before it
+    /// retriggers.
     fn order(&self) -> (usize, u8) {
         (self.frame, matches!(self.msg, MidiMessage::NoteOn { .. }) as u8)
     }
@@ -95,11 +106,17 @@ pub struct Note {
 pub struct Sequence {
     ons: Vec<(f64, u8, u8)>, // (beat, pitch, velocity)
     offs: Vec<(f64, u8)>,    // (beat, pitch)
+    /// Whole notes (start, end, pitch, velocity) sorted by start, for note
+    /// chasing: "which notes are sounding at this position?"
+    notes: Vec<(f64, f64, u8, u8)>,
+    /// The longest note. A note that started before (position - this) has
+    /// certainly ended, which bounds the chase search like the clip list's.
+    max_len: f64,
 }
 
 impl Sequence {
     pub fn empty() -> Self {
-        Self { ons: Vec::new(), offs: Vec::new() }
+        Self { ons: Vec::new(), offs: Vec::new(), notes: Vec::new(), max_len: 0.0 }
     }
 
     /// `clips` are (clip start, clip length, notes). Notes are cut off at
@@ -114,10 +131,13 @@ impl Sequence {
                 let end = (n.start + n.length).min(clip_len);
                 seq.ons.push((clip_start + n.start, n.pitch, n.velocity));
                 seq.offs.push((clip_start + end, n.pitch));
+                seq.notes.push((clip_start + n.start, clip_start + end, n.pitch, n.velocity));
+                seq.max_len = seq.max_len.max(end - n.start);
             }
         }
         seq.ons.sort_by(|a, b| a.0.total_cmp(&b.0));
         seq.offs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        seq.notes.sort_by(|a, b| a.0.total_cmp(&b.0));
         seq
     }
 }
@@ -155,10 +175,12 @@ impl Sequencer {
         std::mem::replace(&mut self.sequence, sequence)
     }
 
+    /// Releases every note we started. These are clean-up, not music, so
+    /// they're `ForceOff`: a held sustain pedal mustn't keep them ringing.
     fn release_held(&mut self, frame: usize, out: &mut EventBuffer) {
         for (note, held) in self.held.iter_mut().enumerate() {
             if *held {
-                out.push(frame, MidiMessage::NoteOff { note: note as u8 });
+                out.push(frame, MidiMessage::ForceOff { note: note as u8 });
                 *held = false;
             }
         }
@@ -181,6 +203,10 @@ impl Sequencer {
         // their note-offs will never be reached. Release them first. (Up to
         // a sample of difference is rounding from a tempo change.)
         let jumped = self.expected_beat.is_some_and(|e| ((beat - e) * spb).abs() > 1.0);
+        // Whenever playback starts somewhere new (play, seek, loop wrap,
+        // or an edit that released everything), chase: start the notes
+        // that are already sounding at this position.
+        let chase = self.expected_beat.is_none() || jumped || self.release_pending;
         if jumped || self.release_pending {
             self.release_held(0, out);
             self.release_pending = false;
@@ -194,6 +220,20 @@ impl Sequencer {
         let frame = |beat: f64| ((at(beat) - start).max(0.0) as usize).min(frames - 1);
 
         let seq = &self.sequence;
+        if chase {
+            // Notes that started before this window and end after its first
+            // sample. Notes starting exactly AT the window's start are left
+            // to the normal scan below. Only notes starting in
+            // [start - longest note, start) can still be sounding.
+            let hi = seq.notes.partition_point(|n| at(n.0) < start);
+            let lo = seq.notes.partition_point(|n| at(n.0 + seq.max_len) <= start);
+            for &(_, end_beat, note, velocity) in &seq.notes[lo..hi] {
+                if at(end_beat) > start {
+                    out.push(0, MidiMessage::NoteOn { note, velocity });
+                    self.held[note as usize] = true;
+                }
+            }
+        }
         let (mut i, off_end) = (
             seq.offs.partition_point(|e| at(e.0) < start),
             seq.offs.partition_point(|e| at(e.0) < end),
@@ -263,7 +303,6 @@ mod tests {
         assert_eq!(MidiMessage::parse(&[0x90, 60, 100]), Some(MidiMessage::NoteOn { note: 60, velocity: 100 }));
         assert_eq!(MidiMessage::parse(&[0x93, 60, 0]), Some(MidiMessage::NoteOff { note: 60 }));
         assert_eq!(MidiMessage::parse(&[0x80, 60, 64]), Some(MidiMessage::NoteOff { note: 60 }));
-        assert_eq!(MidiMessage::parse(&[0xB0, 7, 100]), None);
         assert_eq!(MidiMessage::parse(&[0xF8]), None);
     }
 
@@ -329,7 +368,7 @@ mod tests {
         collect(&mut seqr, &mut t, 1, 512); // note-on
         t.seek_beats(10.0);
         let events = collect(&mut seqr, &mut t, 1, 512);
-        assert_eq!(events, vec![(240_000, MidiMessage::NoteOff { note: 64 })]);
+        assert_eq!(events, vec![(240_000, MidiMessage::ForceOff { note: 64 })]);
     }
 
     #[test]
@@ -351,14 +390,14 @@ mod tests {
             t.advance(n);
         }
         let ons = events.iter().filter(|m| matches!(m, MidiMessage::NoteOn { .. })).count();
-        let offs = events.iter().filter(|m| matches!(m, MidiMessage::NoteOff { .. })).count();
+        let offs = events.iter().filter(|m| matches!(m, MidiMessage::ForceOff { .. })).count();
         assert_eq!(ons, 3, "100 blocks of 512 at 24000/beat = 2.13 loops -> 3 starts");
         assert_eq!(offs, 2, "each wrap releases the held note");
 
         t.playing = false;
         buf.clear();
         seqr.events(&t.context(), 512, &mut buf);
-        assert_eq!(buf.as_slice(), &[MidiEvent { frame: 0, msg: MidiMessage::NoteOff { note: 67 } }]);
+        assert_eq!(buf.as_slice(), &[MidiEvent { frame: 0, msg: MidiMessage::ForceOff { note: 67 } }]);
     }
 
     // ---- Regression tests (from the code review) ----
@@ -405,6 +444,92 @@ mod tests {
         // The user deletes the clip while its note is sounding.
         seqr.replace(Box::new(Sequence::empty()));
         let events = collect(&mut seqr, &mut t, 1, 512);
-        assert_eq!(events.first().map(|e| e.1), Some(MidiMessage::NoteOff { note: 60 }), "note would drone forever");
+        assert_eq!(events.first().map(|e| e.1), Some(MidiMessage::ForceOff { note: 60 }), "note would drone forever");
+    }
+
+    // ---- Step 7 exercise 1: note chasing ----
+
+    fn first_events(seqr: &mut Sequencer, t: &mut Transport) -> Vec<MidiEvent> {
+        let mut buf = EventBuffer::new(64);
+        seqr.events(&t.context(), 512, &mut buf);
+        buf.sort();
+        t.advance(512);
+        buf.as_slice().to_vec()
+    }
+
+    #[test]
+    fn chases_a_note_already_sounding_when_playback_starts() {
+        let mut seqr = one_note(0.0, 4.0);
+        let mut t = Transport::new(48_000.0);
+        t.seek_beats(2.0); // halfway through the note
+        t.playing = true;
+        let events = first_events(&mut seqr, &mut t);
+        assert_eq!(events, vec![MidiEvent { frame: 0, msg: MidiMessage::NoteOn { note: 60, velocity: 100 } }]);
+        assert!(held_after(&seqr));
+        // ...and its normal note-off still arrives at beat 4.
+        let rest = collect(&mut seqr, &mut t, 100, 512);
+        assert_eq!(rest, vec![(96_000, MidiMessage::NoteOff { note: 60 })]);
+    }
+
+    #[test]
+    fn does_not_chase_finished_or_future_notes() {
+        let notes = [
+            Note { start: 0.0, length: 1.0, pitch: 50, velocity: 100 }, // over
+            Note { start: 1.5, length: 4.0, pitch: 60, velocity: 100 }, // sounding
+            Note { start: 2.0, length: 1.0, pitch: 70, velocity: 100 }, // exactly at start
+            Note { start: 3.0, length: 1.0, pitch: 80, velocity: 100 }, // future
+        ];
+        let mut seqr = Sequencer::new();
+        seqr.replace(Box::new(Sequence::build([(0.0, 8.0, &notes[..])])));
+        let mut t = Transport::new(48_000.0);
+        t.seek_beats(2.0);
+        t.playing = true;
+        let ons: Vec<u8> = first_events(&mut seqr, &mut t)
+            .iter()
+            .filter_map(|e| match e.msg {
+                MidiMessage::NoteOn { note, .. } => Some(note),
+                _ => None,
+            })
+            .collect();
+        // 60 is chased; 70 starts by the normal scan (once, not twice).
+        assert_eq!(ons, vec![60, 70]);
+    }
+
+    #[test]
+    fn chases_after_a_loop_wrap_and_an_edit() {
+        // A pad held across the loop's start: it must come back each lap.
+        let notes = [Note { start: 0.0, length: 8.0, pitch: 55, velocity: 90 }];
+        let mut seqr = Sequencer::new();
+        seqr.replace(Box::new(Sequence::build([(0.0, 8.0, &notes[..])])));
+        let mut t = Transport::new(48_000.0);
+        t.set_loop(Some((2.0, 3.0)));
+        t.seek_beats(2.0);
+        t.playing = true;
+        let mut buf = EventBuffer::new(64);
+        let mut ons = 0;
+        for _ in 0..200 {
+            let n = t.frames_until_boundary(512);
+            buf.clear();
+            seqr.events(&t.context(), n, &mut buf);
+            ons += buf.as_slice().iter().filter(|e| matches!(e.msg, MidiMessage::NoteOn { .. })).count();
+            t.advance(n);
+        }
+        assert!(ons >= 4, "the held pad restarts on every lap ({ons})");
+
+        // Editing a different note releases everything, then chasing
+        // restarts the pad that still exists, instead of leaving silence.
+        let mut edited = notes.to_vec();
+        edited.push(Note { start: 6.0, length: 1.0, pitch: 70, velocity: 90 });
+        seqr.replace(Box::new(Sequence::build([(0.0, 8.0, &edited[..])])));
+        let events = first_events(&mut seqr, &mut t);
+        assert_eq!(
+            events.iter().map(|e| e.msg).collect::<Vec<_>>(),
+            vec![MidiMessage::ForceOff { note: 55 }, MidiMessage::NoteOn { note: 55, velocity: 90 }]
+        );
+    }
+
+    #[test]
+    fn parses_control_changes() {
+        assert_eq!(MidiMessage::parse(&[0xB0, 64, 127]), Some(MidiMessage::ControlChange { controller: 64, value: 127 }));
     }
 }

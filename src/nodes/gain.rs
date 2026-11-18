@@ -1,5 +1,5 @@
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::transport::ProcessContext;
 use crate::smoothing::Smoothed;
 
@@ -22,8 +22,11 @@ impl Processor for Gain {
         "gain"
     }
 
-    fn params(&self) -> &'static [&'static str] {
-        &["db"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[ParamInfo::linear("db", -60.0, 12.0, 0.0, "dB")];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {

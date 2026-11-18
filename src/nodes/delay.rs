@@ -1,7 +1,7 @@
 //! A feedback delay (echo), optionally synced to the tempo.
 
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::smoothing::Smoothed;
 use crate::transport::ProcessContext;
 use std::f32::consts::TAU;
@@ -50,6 +50,8 @@ pub struct Delay {
     /// like analog and tape echoes.
     damp_coeff: f32,
     damp_state: [f32; 2],
+    /// Echoes alternate left and right.
+    ping_pong: bool,
 }
 
 impl Delay {
@@ -67,6 +69,7 @@ impl Delay {
             mix: Smoothed::new(0.3),
             damp_coeff: 1.0,
             damp_state: [0.0; 2],
+            ping_pong: false,
         }
     }
 
@@ -95,9 +98,19 @@ impl Processor for Delay {
     }
 
     /// ms: delay time; beats: tempo-synced time (0 = use ms);
-    /// feedback 0..0.95; damp 0..1; mix 0..1 (dry/wet).
-    fn params(&self) -> &'static [&'static str] {
-        &["ms", "beats", "feedback", "damp", "mix"]
+    /// feedback 0..0.95; damp 0..1; mix 0..1 (dry/wet); pingpong 0/1.
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[
+                ParamInfo::log("ms", 1.0, 4_000.0, 250.0, "ms"),
+                ParamInfo::linear("beats", 0.0, 16.0, 0.0, "beats"),
+                ParamInfo::linear("feedback", 0.0, 0.95, 0.4, ""),
+                ParamInfo::linear("damp", 0.0, 1.0, 0.3, ""),
+                ParamInfo::linear("mix", 0.0, 1.0, 0.3, ""),
+                ParamInfo::toggle("pingpong", false),
+            ];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {
@@ -121,6 +134,7 @@ impl Processor for Delay {
             2 => self.feedback.set(value.clamp(0.0, 0.95)),
             3 => self.set_damp(value),
             4 => self.mix.set(value.clamp(0.0, 1.0)),
+            5 => self.ping_pong = value >= 0.5,
             _ => {}
         }
     }
@@ -138,21 +152,41 @@ impl Processor for Delay {
         };
         self.time.set(target.clamp(1.0, self.max_delay()));
 
-        let channels = buffer.channels().min(self.lines.len());
-        for i in 0..buffer.frames() {
+        if buffer.channels() < 2 || self.lines.len() < 2 {
+            return;
+        }
+        let (line_l, line_r) = self.lines.split_at_mut(1);
+        let (line_l, line_r) = (&mut line_l[0], &mut line_r[0]);
+        let mask = line_l.mask;
+        let (out_l, out_r) = buffer.stereo_mut();
+        for (l, r) in out_l.iter_mut().zip(out_r.iter_mut()) {
             let delay = self.time.next();
             let feedback = self.feedback.next();
             let mix = self.mix.next();
-            for ch in 0..channels {
-                let line = &mut self.lines[ch];
-                let x = buffer.channel(ch)[i];
-                let wet = line.read(self.write, delay);
-                let damped = &mut self.damp_state[ch];
-                *damped += self.damp_coeff * (wet - *damped);
-                line.buf[self.write] = x + *damped * feedback;
-                buffer.channel_mut(ch)[i] = x + (wet - x) * mix;
-            }
-            self.write = (self.write + 1) & self.lines[0].mask;
+            let (x_l, x_r) = (*l, *r);
+
+            let wet_l = line_l.read(self.write, delay);
+            let wet_r = line_r.read(self.write, delay);
+            let [d_l, d_r] = &mut self.damp_state;
+            *d_l += self.damp_coeff * (wet_l - *d_l);
+            *d_r += self.damp_coeff * (wet_r - *d_r);
+
+            let (into_l, into_r) = if self.ping_pong {
+                // The input goes in on the LEFT only, and each side's
+                // feedback goes into the OTHER side: left, right, left...
+                // It's summed to mono first: a centered sound fed into both
+                // lines would echo on both sides at once, and swapping two
+                // identical signals changes nothing, so nothing would bounce.
+                ((x_l + x_r) * 0.5 + *d_r * feedback, *d_l * feedback)
+            } else {
+                (x_l + *d_l * feedback, x_r + *d_r * feedback)
+            };
+            line_l.buf[self.write] = into_l;
+            line_r.buf[self.write] = into_r;
+
+            *l = x_l + (wet_l - x_l) * mix;
+            *r = x_r + (wet_r - x_r) * mix;
+            self.write = (self.write + 1) & mask;
         }
     }
 }
@@ -228,5 +262,28 @@ mod tests {
         // its energy is smeared over neighboring samples.
         let peak = |c: usize| out[c - 20..c + 60].iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(peak(960) < 0.9 * peak(480));
+    }
+
+    #[test]
+    fn ping_pong_alternates_sides() {
+        let mut d = delay();
+        d.set_param(0, 10.0); // 480 samples
+        d.prepare(&PrepareInfo { sample_rate: SR, max_frames: 48_000, channels: 2 });
+        d.set_param(3, 0.0);
+        d.set_param(5, 1.0);
+        d.mix = Smoothed::new(1.0);
+        d.feedback = Smoothed::new(0.5);
+        // A CENTERED impulse: both channels at once.
+        let mut buf = AudioBuffer::new(2, 2_000);
+        buf.clear();
+        buf.channel_mut(0)[0] = 1.0;
+        buf.channel_mut(1)[0] = 1.0;
+        d.process(&mut buf, &Transport::new(SR as f64).context());
+        let (l, r) = buf.stereo();
+        let hits = |x: &[f32]| (0..x.len()).filter(|&i| x[i].abs() > 0.05).collect::<Vec<_>>();
+        assert_eq!(hits(l), vec![480, 1440], "left: 1st and 3rd echoes");
+        assert_eq!(hits(r), vec![960, 1920], "right: 2nd and 4th");
+        assert!((l[480] - 1.0).abs() < 1e-6 && (r[960] - 0.5).abs() < 1e-6);
+        assert!((l[1440] - 0.25).abs() < 1e-6 && (r[1920] - 0.125).abs() < 1e-6);
     }
 }

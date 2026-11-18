@@ -1,5 +1,6 @@
 //! Tracks, the aux and master buses, and metering.
 
+use crate::automation::{AutoTarget, AutomationSet};
 use crate::buffer::AudioBuffer;
 use crate::clip::ClipList;
 use crate::midi::{EventBuffer, MidiMessage, Sequence, Sequencer};
@@ -17,7 +18,7 @@ pub const MAX_SLOTS: usize = 16;
 pub const MIX_CHANNELS: usize = 2;
 
 /// Where a command is aimed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Target {
     Master,
     Aux,
@@ -56,6 +57,7 @@ pub struct Track {
     sequencer: Sequencer,
     /// Reused every block for this track's MIDI events.
     events: EventBuffer,
+    automation: Box<AutomationSet>,
     slots: Vec<Option<Box<dyn Processor>>>,
     /// The track's own working buffer, so its chain can't affect others.
     buffer: AudioBuffer,
@@ -87,6 +89,7 @@ impl Track {
             instrument: None,
             sequencer: Sequencer::new(),
             events: EventBuffer::new(512),
+            automation: Box::new(AutomationSet::default()),
             slots,
             buffer: AudioBuffer::new(MIX_CHANNELS, info.max_frames),
             volume,
@@ -119,6 +122,41 @@ impl Track {
         self.instrument.as_mut()
     }
 
+    /// Returns the old automation, to be freed on the main thread.
+    pub fn replace_automation(&mut self, automation: Box<AutomationSet>) -> Box<AutomationSet> {
+        std::mem::replace(&mut self.automation, automation)
+    }
+
+    /// Applies every automation lane's value at the window's start. Values
+    /// go through the same setters as manual changes, so the smoothers
+    /// turn these block-rate steps into continuous ramps.
+    fn apply_automation(&mut self, ctx: &ProcessContext) {
+        if self.automation.lanes.is_empty() {
+            return;
+        }
+        let beat = ctx.position as f64 / ctx.samples_per_beat();
+        // Borrow the fields separately: the lanes are iterated mutably
+        // while the things they control are changed.
+        let Track { automation, slots, instrument, volume, pan, .. } = self;
+        for lane in &mut automation.lanes {
+            let Some(v) = lane.changed_value_at(beat) else { continue };
+            match lane.target {
+                AutoTarget::Volume => volume.set(db_to_gain(v)),
+                AutoTarget::Pan => pan.set(v.clamp(-1.0, 1.0)),
+                AutoTarget::Node { slot, param } => {
+                    if let Some(node) = slots.get_mut(slot).and_then(|s| s.as_mut()) {
+                        node.set_param(param, v);
+                    }
+                }
+                AutoTarget::Instrument { param } => {
+                    if let Some(inst) = instrument.as_mut() {
+                        inst.set_param(param, v);
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns the old sequence, to be freed on the main thread.
     pub fn replace_sequence(&mut self, sequence: Box<Sequence>) -> Box<Sequence> {
         self.sequencer.replace(sequence)
@@ -141,10 +179,16 @@ impl Track {
         &mut self.buffer
     }
 
-    fn run_chain(&mut self, ctx: &ProcessContext) {
+    fn run_chain(&mut self, ctx: &ProcessContext, key: Option<&AudioBuffer>) {
         for node in self.slots.iter_mut().flatten() {
-            node.process(&mut self.buffer, ctx);
+            node.process_keyed(&mut self.buffer, ctx, key);
         }
+    }
+
+    /// The track's own buffer: after its chain, before its fader. This is
+    /// where a sidechain is tapped from.
+    pub fn output(&self) -> &AudioBuffer {
+        &self.buffer
     }
 
     /// Peak of each channel of the track's buffer.
@@ -157,7 +201,8 @@ impl Track {
     /// Renders this track for frames `offset..offset+n` of the block and
     /// adds the result into `master` and, scaled by the send, into `aux`
     /// (whose windows the caller has set). `live` holds live MIDI for this
-    /// window, with frames counted from `live_base`.
+    /// window, with frames counted from `live_base`. `key` is the sidechain
+    /// signal for this window, if the track has one.
     #[allow(clippy::too_many_arguments)]
     pub fn render_into(
         &mut self,
@@ -169,9 +214,11 @@ impl Track {
         aux: &mut AudioBuffer,
         live: &[(usize, MidiMessage)],
         live_base: usize,
+        key: Option<&AudioBuffer>,
     ) -> TrackPeaks {
         self.buffer.set_window(offset, n);
         self.buffer.clear();
+        self.apply_automation(ctx);
         // Clips and the instrument write the track's raw audio; the chain
         // then processes it.
         self.clips.render(&mut self.buffer, ctx);
@@ -189,7 +236,7 @@ impl Track {
         // state (filter memory, oscillator phase) that
         // must keep moving with time, and we can't know whether a chain is
         // silent without running it: a clip might start this very block.
-        self.run_chain(ctx);
+        self.run_chain(ctx, key);
         let (pre_l, pre_r) = self.peaks();
         let pre = pre_l.max(pre_r);
 
@@ -262,7 +309,7 @@ impl Track {
     /// For buses: run the chain and volume on the bus in place.
     /// The caller has already set the window. Returns the peak.
     pub fn process_in_place(&mut self, ctx: &ProcessContext) -> f32 {
-        self.run_chain(ctx);
+        self.run_chain(ctx, None);
         let (l, r) = self.buffer.stereo_mut();
         if self.volume.is_settled() {
             let gain = self.volume.value();
