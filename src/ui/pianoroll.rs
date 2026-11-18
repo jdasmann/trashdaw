@@ -160,7 +160,7 @@ impl DawApp {
             painter.rect_filled(row, Rounding::ZERO, Color32::from_gray(shade));
             if pitch.rem_euclid(12) == 0 {
                 painter.text(Pos2::new(area.left() + 4.0, y + ROW_H / 2.0), Align2::LEFT_CENTER, format!("C{}", pitch / 12 - 1), FontId::proportional(10.0), Color32::from_gray(200));
-                painter.line_segment([Pos2::new(grid_rect.left(), y + ROW_H), Pos2::new(area.right(), y + ROW_H)], Stroke::new(1.0, Color32::from_gray(60)));
+                painter.line_segment([Pos2::new(grid_rect.left(), y + ROW_H), Pos2::new(area.right(), y + ROW_H)], Stroke::new(1.0_f32, Color32::from_gray(60)));
             }
         }
         // Beat lines, and shade past the clip's end (notes are cut there).
@@ -168,7 +168,7 @@ impl DawApp {
         while view.beat_to_x(beat) < grid_rect.right() {
             let x = view.beat_to_x(beat);
             let strong = (beat % 4.0).abs() < 1e-9;
-            painter.line_segment([Pos2::new(x, area.top()), Pos2::new(x, area.bottom())], Stroke::new(1.0, Color32::from_gray(if strong { 75 } else { 52 })));
+            painter.line_segment([Pos2::new(x, area.top()), Pos2::new(x, area.bottom())], Stroke::new(1.0_f32, Color32::from_gray(if strong { 75 } else { 52 })));
             beat += grid;
         }
         let end_x = view.beat_to_x(clip_len);
