@@ -1,5 +1,5 @@
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::transport::ProcessContext;
 use std::f32::consts::TAU;
 
@@ -37,8 +37,11 @@ impl Processor for Metronome {
         "click"
     }
 
-    fn params(&self) -> &'static [&'static str] {
-        &["level", "beats"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[ParamInfo::linear("level", 0.0, 1.0, 0.3, ""), ParamInfo::int("beats", 1.0, 16.0, 4.0)];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {

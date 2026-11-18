@@ -4,7 +4,7 @@
 //! series smear it so individual echoes blur into a smooth tail.
 
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::smoothing::Smoothed;
 use crate::transport::ProcessContext;
 
@@ -129,8 +129,16 @@ impl Processor for Reverb {
     }
 
     /// size, damp, width, mix: all 0..1.
-    fn params(&self) -> &'static [&'static str] {
-        &["size", "damp", "width", "mix"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[
+                ParamInfo::linear("size", 0.0, 1.0, 0.5, ""),
+                ParamInfo::linear("damp", 0.0, 1.0, 0.5, ""),
+                ParamInfo::linear("width", 0.0, 1.0, 1.0, ""),
+                ParamInfo::linear("mix", 0.0, 1.0, 0.25, ""),
+            ];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {

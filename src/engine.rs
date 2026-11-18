@@ -1,5 +1,7 @@
+use crate::buffer::AudioBuffer;
+use crate::automation::AutomationSet;
 use crate::clip::ClipList;
-use crate::midi::{LiveMidi, MidiMessage, Sequence};
+use crate::midi::{LiveMidi, MidiMessage, Sequence, SUSTAIN_PEDAL};
 use crate::mixer::{MeterPoint, Meters, Target, Track, MAX_TRACKS, MIX_CHANNELS};
 use crate::processor::{Instrument, PrepareInfo, Processor};
 use crate::transport::{Transport, TransportShared};
@@ -15,12 +17,16 @@ pub enum Command {
     RemoveTrack { index: usize },
     /// A complete new clip list for a track, replacing the old one.
     SetClips { track: usize, clips: Box<ClipList> },
+    /// A track's automation lanes, replacing the old ones.
+    SetAutomation { track: usize, automation: Box<AutomationSet> },
     /// A track's MIDI clips, compiled into one note timeline.
     SetSequence { track: usize, sequence: Box<Sequence> },
     SetInstrument { track: usize, instrument: Option<Box<dyn Instrument>> },
     SetInstrumentParam { track: usize, param: usize, value: f32 },
     /// Which track receives live MIDI input.
     Arm { track: Option<usize> },
+    /// Which track's signal `track`'s nodes may listen to (sidechain).
+    SetSidechain { track: usize, source: Option<usize> },
     /// The node arrives already constructed and prepared. Moving a Box
     /// through the queue is just moving a pointer: no allocation.
     Insert { target: Target, slot: usize, node: Box<dyn Processor> },
@@ -46,6 +52,7 @@ pub enum Garbage {
     Track(Box<Track>),
     Clips(Box<ClipList>),
     Sequence(Box<Sequence>),
+    Automation(Box<AutomationSet>),
     Instrument(Box<dyn Instrument>),
 }
 
@@ -67,12 +74,24 @@ pub struct Engine {
     armed: Option<usize>,
     /// Live notes currently held down on the armed track.
     live_held: [bool; 128],
+    /// Whether the armed track's sustain pedal is down.
+    live_pedal: bool,
     /// When the armed track changes while keys are held, the old track
     /// gets these note-offs, or its notes would never be released.
     release_on: Option<usize>,
     release_events: Vec<(usize, MidiMessage)>,
     last_callback: Option<Instant>,
     sample_rate: f64,
+    // --- Sidechains ---
+    /// keys[t] = the track whose signal track t listens to.
+    keys: [Option<usize>; MAX_TRACKS],
+    /// Tracks in the order they must render: every key source before the
+    /// tracks that listen to it. Rebuilt only when a sidechain changes.
+    order: Vec<usize>,
+    /// A copy of each key source's output for the current window. Copying
+    /// sidesteps borrowing two tracks at once, and costs very little.
+    key_buffers: Vec<AudioBuffer>,
+    is_key_source: [bool; MAX_TRACKS],
 }
 
 impl Engine {
@@ -102,10 +121,48 @@ impl Engine {
             live: Vec::with_capacity(256),
             armed: None,
             live_held: [false; 128],
+            live_pedal: false,
             release_on: None,
             release_events: Vec::with_capacity(128),
             last_callback: None,
             sample_rate: info.sample_rate as f64,
+            keys: [None; MAX_TRACKS],
+            order: (0..MAX_TRACKS).collect(),
+            key_buffers: (0..MAX_TRACKS).map(|_| AudioBuffer::new(MIX_CHANNELS, info.max_frames)).collect(),
+            is_key_source: [false; MAX_TRACKS],
+        }
+    }
+
+    /// Orders tracks so each key source renders before its listeners. Each
+    /// track has at most one source, so this just walks each chain of
+    /// sources to its top and adds it top-down. Fixed-size arrays only:
+    /// it runs on the audio thread, so it must not allocate. (`order` has
+    /// capacity for every track, so its pushes don't either.)
+    fn rebuild_order(&mut self) {
+        self.order.clear();
+        let mut done = [false; MAX_TRACKS];
+        for start in 0..MAX_TRACKS {
+            let mut chain = [0usize; MAX_TRACKS];
+            let mut len = 0;
+            let mut current = Some(start);
+            while let Some(t) = current {
+                // Stop at anything already placed, or at a cycle (which the
+                // main thread refuses to create, but never trust that here).
+                if done[t] || chain[..len].contains(&t) {
+                    break;
+                }
+                chain[len] = t;
+                len += 1;
+                current = self.keys[t];
+            }
+            for &t in chain[..len].iter().rev() {
+                done[t] = true;
+                self.order.push(t);
+            }
+        }
+        self.is_key_source = [false; MAX_TRACKS];
+        for source in self.keys.iter().flatten() {
+            self.is_key_source[*source] = true;
         }
     }
 
@@ -130,11 +187,22 @@ impl Engine {
                     }
                 }
                 Command::RemoveTrack { index } => {
+                    // Forget any sidechain to or from the removed track.
+                    if self.keys[index].is_some() || self.is_key_source[index] {
+                        self.keys[index] = None;
+                        for key in &mut self.keys {
+                            if *key == Some(index) {
+                                *key = None;
+                            }
+                        }
+                        self.rebuild_order();
+                    }
                     if self.armed == Some(index) {
                         // Otherwise a new track created in this slot would
                         // silently be armed. Its notes go with the track.
                         self.armed = None;
                         self.live_held = [false; 128];
+                        self.live_pedal = false;
                     }
                     // The track's nodes go with it, freed on the main thread.
                     if let Some(old) = self.tracks[index].take() {
@@ -149,6 +217,13 @@ impl Engine {
                         None => clips, // track gone: send it straight back
                     };
                     self.retire(Garbage::Clips(old));
+                }
+                Command::SetAutomation { track, automation } => {
+                    let old = match self.track_mut(track) {
+                        Some(t) => t.replace_automation(automation),
+                        None => automation,
+                    };
+                    self.retire(Garbage::Automation(old));
                 }
                 Command::SetSequence { track, sequence } => {
                     let old = match self.track_mut(track) {
@@ -171,15 +246,29 @@ impl Engine {
                         inst.set_param(param, value);
                     }
                 }
+                Command::SetSidechain { track, source } => {
+                    if track < MAX_TRACKS && source.map_or(true, |s| s < MAX_TRACKS && s != track) {
+                        self.keys[track] = source;
+                        self.rebuild_order();
+                    }
+                }
                 Command::Arm { track } => {
                     // (If a release is already waiting to be delivered, keep
                     // it: nothing new can be held until the next callback.)
                     if track != self.armed && self.release_on.is_none() {
                         self.release_events.clear();
                         if let Some(old) = self.armed {
+                            // Lift the old track's pedal first (releasing
+                            // notes it was sustaining), then stop held keys.
+                            // ForceOff, because these are clean-up.
+                            if self.live_pedal {
+                                self.release_events
+                                    .push((0, MidiMessage::ControlChange { controller: SUSTAIN_PEDAL, value: 0 }));
+                                self.live_pedal = false;
+                            }
                             for (note, held) in self.live_held.iter_mut().enumerate() {
                                 if *held {
-                                    self.release_events.push((0, MidiMessage::NoteOff { note: note as u8 }));
+                                    self.release_events.push((0, MidiMessage::ForceOff { note: note as u8 }));
                                     *held = false;
                                 }
                             }
@@ -270,7 +359,11 @@ impl Engine {
                 self.live.push((frame.min(frames.saturating_sub(1)), ev.msg));
                 match ev.msg {
                     MidiMessage::NoteOn { note, .. } => self.live_held[note as usize] = true,
-                    MidiMessage::NoteOff { note } => self.live_held[note as usize] = false,
+                    MidiMessage::NoteOff { note } | MidiMessage::ForceOff { note } => {
+                        self.live_held[note as usize] = false
+                    }
+                    MidiMessage::ControlChange { controller: SUSTAIN_PEDAL, value } => self.live_pedal = value >= 64,
+                    MidiMessage::ControlChange { .. } => {}
                 }
             }
         }
@@ -323,8 +416,12 @@ impl Engine {
                 let window = block_start + offset;
                 let lo = self.live.partition_point(|e| e.0 < window);
                 let hi = self.live.partition_point(|e| e.0 < window + n);
-                for (i, slot) in self.tracks.iter_mut().enumerate() {
-                    if let Some(track) = slot {
+                for k in 0..self.order.len() {
+                    let i = self.order[k];
+                    // Only listen to a source that exists (and so rendered).
+                    let key_source = self.keys[i].filter(|&s| self.tracks[s].is_some());
+                    if let Some(track) = self.tracks[i].as_mut() {
+                        let key = key_source.map(|s| &self.key_buffers[s]);
                         let live = if self.armed == Some(i) {
                             &self.live[lo..hi]
                         } else if self.release_on == Some(i) && window == 0 {
@@ -332,9 +429,19 @@ impl Engine {
                         } else {
                             &[][..]
                         };
-                        let peaks = track.render_into(offset, n, &ctx, any_solo, master_bus, aux_bus, live, window);
+                        let peaks = track.render_into(offset, n, &ctx, any_solo, master_bus, aux_bus, live, window, key);
                         self.meters.record(Target::Track(i), MeterPoint::PreFader, peaks.pre);
                         self.meters.record(Target::Track(i), MeterPoint::PostFader, peaks.post);
+                        // If anyone listens to this track, keep a copy of
+                        // this window's output for them.
+                        if self.is_key_source[i] {
+                            let (src_l, src_r) = track.output().stereo();
+                            let kb = &mut self.key_buffers[i];
+                            kb.set_window(offset, n);
+                            let (key_l, key_r) = kb.stereo_mut();
+                            key_l.copy_from_slice(src_l);
+                            key_r.copy_from_slice(src_r);
+                        }
                     }
                 }
 
@@ -430,7 +537,7 @@ mod tests {
     struct Dc(f32);
     impl Processor for Dc {
         fn name(&self) -> &'static str { "dc" }
-        fn params(&self) -> &'static [&'static str] { &[] }
+        fn param_info(&self) -> &'static [crate::processor::ParamInfo] { &[] }
         fn prepare(&mut self, _: &PrepareInfo) {}
         fn set_param(&mut self, _: usize, _: f32) {}
         fn process(&mut self, b: &mut AudioBuffer, _: &ProcessContext) {
@@ -446,7 +553,7 @@ mod tests {
     struct Probe(Arc<Mutex<Vec<(u64, usize)>>>);
     impl Processor for Probe {
         fn name(&self) -> &'static str { "probe" }
-        fn params(&self) -> &'static [&'static str] { &[] }
+        fn param_info(&self) -> &'static [crate::processor::ParamInfo] { &[] }
         fn prepare(&mut self, _: &PrepareInfo) {}
         fn set_param(&mut self, _: usize, _: f32) {}
         fn process(&mut self, b: &mut AudioBuffer, ctx: &ProcessContext) {
@@ -623,7 +730,7 @@ mod tests {
     struct EventProbe(Arc<Mutex<Vec<(usize, MidiMessage)>>>);
     impl Instrument for EventProbe {
         fn name(&self) -> &'static str { "probe" }
-        fn params(&self) -> &'static [&'static str] { &[] }
+        fn param_info(&self) -> &'static [crate::processor::ParamInfo] { &[] }
         fn prepare(&mut self, _: &PrepareInfo) {}
         fn set_param(&mut self, _: usize, _: f32) {}
         fn render(&mut self, _: &mut AudioBuffer, _: &ProcessContext, events: &[crate::midi::MidiEvent]) {
@@ -707,7 +814,7 @@ mod tests {
         h.send(Command::Arm { track: Some(1) });
         h.engine.render(&mut out);
         let got = first.lock().unwrap().clone();
-        assert_eq!(got.last().map(|e| e.1), Some(MidiMessage::NoteOff { note: 62 }), "stuck note: {got:?}");
+        assert_eq!(got.last().map(|e| e.1), Some(MidiMessage::ForceOff { note: 62 }), "stuck note: {got:?}");
     }
 
     #[test]
@@ -748,6 +855,142 @@ mod tests {
         h.send(Command::Arm { track: Some(1) });
         h.send(Command::Arm { track: Some(2) });
         h.engine.render(&mut out);
-        assert_eq!(first.lock().unwrap().last().map(|e| e.1), Some(MidiMessage::NoteOff { note: 62 }));
+        assert_eq!(first.lock().unwrap().last().map(|e| e.1), Some(MidiMessage::ForceOff { note: 62 }));
+    }
+
+    // ---- Step 8 exercise 1: sidechain ----
+
+    /// Track 0: steady "bass" at 0.5 with a sidechained compressor.
+    /// Track 3: the "kick" key, a higher number, so it must render first.
+    fn sidechain_setup(key_level: f32) -> Harness {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.add_track(3);
+        h.insert(0, Box::new(Dc(0.5)));
+        let mut comp: Box<dyn Processor> = Box::new(crate::nodes::Compressor::new());
+        comp.prepare(&INFO);
+        comp.set_param(0, -30.0); // threshold
+        comp.set_param(1, 10.0); // ratio
+        comp.set_param(4, 0.0); // hard knee
+        h.send(Command::Insert { target: Target::Track(0), slot: 1, node: comp });
+        h.insert(3, Box::new(Dc(key_level)));
+        h.send(Command::SetVolume { target: Target::Track(3), db: -60.0 }); // key not heard
+        h.send(Command::SetSidechain { track: 0, source: Some(3) });
+        h
+    }
+
+    #[test]
+    fn sidechain_ducks_by_the_key_not_the_signal() {
+        // The bass (0.5 = -6 dB) is above the -30 dB threshold, but with a
+        // silent key nothing is compressed: the detector listens to the key.
+        let mut h = sidechain_setup(0.0);
+        assert!((h.settle(2)[0] - 0.5).abs() < 1e-3, "silent key: bass untouched");
+
+        // A loud key (-6 dB, 24 dB over at 10:1) ducks the bass by 21.6 dB,
+        // even though the key track itself is turned all the way down.
+        let mut h = sidechain_setup(0.5);
+        let out = h.settle(2)[0];
+        let expected = 0.5 * 10f32.powf(-21.6 / 20.0);
+        assert!((out - expected).abs() < 1e-3, "got {out}, expected {expected}");
+    }
+
+    #[test]
+    fn render_order_puts_key_sources_first() {
+        let mut h = Harness::new(2);
+        h.send(Command::SetSidechain { track: 0, source: Some(5) });
+        h.send(Command::SetSidechain { track: 5, source: Some(9) });
+        let mut out = vec![0f32; 512 * 2];
+        h.engine.render(&mut out);
+        let pos = |t: usize| h.engine.order.iter().position(|&x| x == t).unwrap();
+        assert!(pos(9) < pos(5) && pos(5) < pos(0), "{:?}", h.engine.order);
+        assert_eq!(h.engine.order.len(), MAX_TRACKS, "every track exactly once");
+    }
+
+    #[test]
+    fn removing_the_key_track_returns_to_normal_compression() {
+        // With a silent key the bass passes untouched...
+        let mut h = sidechain_setup(0.0);
+        assert!((h.settle(2)[0] - 0.5).abs() < 1e-3);
+        // ...and with the key track gone, the compressor listens to its own
+        // track again, like any compressor: the -6 dB bass is now 24 dB
+        // over the threshold, and gets turned down by itself.
+        h.send(Command::RemoveTrack { index: 3 });
+        let out = h.settle(2)[0];
+        assert!((out - 0.5 * 10f32.powf(-21.6 / 20.0)).abs() < 1e-3, "got {out}");
+        assert_eq!(h.engine.keys[0], None);
+    }
+
+    #[test]
+    fn rearming_with_the_pedal_down_lifts_it_on_the_old_track() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.add_track(1);
+        let first = Arc::new(Mutex::new(Vec::new()));
+        h.send(Command::SetInstrument { track: 0, instrument: Some(Box::new(EventProbe(first.clone()))) });
+        h.send(Command::Arm { track: Some(0) });
+        let mut out = vec![0f32; 512 * 2];
+        h.engine.render(&mut out);
+        let at = h.engine.last_callback.unwrap();
+        // Pedal down, play a note, let go of the key: the note is sustained.
+        for msg in [
+            MidiMessage::ControlChange { controller: 64, value: 127 },
+            MidiMessage::NoteOn { note: 62, velocity: 90 },
+            MidiMessage::NoteOff { note: 62 },
+        ] {
+            assert!(h.live_tx.push(LiveMidi { at, msg }).is_ok());
+        }
+        h.engine.render(&mut out);
+        h.send(Command::Arm { track: Some(1) });
+        h.engine.render(&mut out);
+        // The pedal-up would otherwise go to the new track, and track 0's
+        // sustained note would ring forever.
+        let got: Vec<MidiMessage> = first.lock().unwrap().iter().map(|e| e.1).collect();
+        assert_eq!(got.last(), Some(&MidiMessage::ControlChange { controller: 64, value: 0 }), "{got:?}");
+    }
+
+    // ---- Step 9 exercise 3: automation ----
+
+    fn automated_gain(points: Vec<(f64, f32)>) -> Harness {
+        use crate::automation::{AutoTarget, Envelope, Lane};
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.insert(0, Box::new(Dc(0.5)));
+        let mut gain: Box<dyn Processor> = Box::new(crate::nodes::Gain::new());
+        gain.prepare(&INFO);
+        let info = gain.param_info()[0];
+        h.send(Command::Insert { target: Target::Track(0), slot: 1, node: gain });
+        let lane = Lane::new(AutoTarget::Node { slot: 1, param: 0 }, info, Envelope::new(points));
+        h.send(Command::SetAutomation { track: 0, automation: Box::new(AutomationSet { lanes: vec![lane] }) });
+        h
+    }
+
+    fn db(x: f32) -> f32 {
+        20.0 * x.abs().log10()
+    }
+
+    #[test]
+    fn automation_ramps_a_parameter_over_time() {
+        use crate::automation::{normalize, VOLUME_INFO};
+        // The gain node's range is the same as the fader's: -60..+12 dB.
+        let n = |db: f32| normalize(&VOLUME_INFO, db);
+        let mut h = automated_gain(vec![(0.0, n(0.0)), (4.0, n(-24.0))]);
+        h.send(Command::Play);
+        let mut out = vec![0f32; 512 * 2];
+        // Beat 2 at 120 BPM / 48 kHz = sample 48_000: halfway down the ramp.
+        for _ in 0..(48_000 / 512) {
+            h.engine.render(&mut out);
+        }
+        let level = db(out[0]) - db(0.5);
+        assert!((level - -12.0).abs() < 0.5, "halfway: {level:.2} dB");
+    }
+
+    #[test]
+    fn automation_applies_on_seek_even_while_stopped() {
+        use crate::automation::{normalize, VOLUME_INFO};
+        let n = |db: f32| normalize(&VOLUME_INFO, db);
+        let mut h = automated_gain(vec![(0.0, n(0.0)), (4.0, n(0.0)), (4.0, n(-20.0))]);
+        h.send(Command::Seek { beat: 8.0 });
+        let out = h.settle(2); // stopped the whole time
+        assert!((db(out[0]) - db(0.5) - -20.0).abs() < 0.1, "the value at the playhead, without playing");
     }
 }

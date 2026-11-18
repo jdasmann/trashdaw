@@ -8,6 +8,7 @@ cpal = "0.15"   # cross-platform audio I/O
 rtrb = "0.3"    # lock-free single-producer/single-consumer ring buffer
 symphonia = { version = "0.5", features = ["mp3"] }  # audio file decoding
 midir = "0.11"   # MIDI input from hardware and virtual ports
+eframe = "0.27"  # egui UI framework (window, input, rendering)
 
 [profile.dev]
 opt-level = 1   # unoptimized DSP can be too slow even for testing

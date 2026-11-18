@@ -6,7 +6,7 @@
 //! standard reference for these formulas.
 
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::smoothing::Smoothed;
 use crate::transport::ProcessContext;
 use std::f64::consts::TAU;
@@ -96,14 +96,14 @@ impl Coeffs {
 /// needs only two state values per channel and behaves well numerically
 /// when coefficients change.
 #[derive(Clone, Copy, Default)]
-struct State {
+pub(super) struct State {
     z1: f64,
     z2: f64,
 }
 
 impl State {
     #[inline(always)]
-    fn tick(&mut self, c: &Coeffs, x: f64) -> f64 {
+    pub(super) fn tick(&mut self, c: &Coeffs, x: f64) -> f64 {
         let y = c.b0 * x + self.z1;
         self.z1 = c.b1 * x - c.a1 * y + self.z2;
         self.z2 = c.b2 * x - c.a2 * y;
@@ -114,7 +114,7 @@ impl State {
 /// While a parameter moves, recompute coefficients every this many
 /// samples. The math (sin, cos, pow) is too expensive per sample, and
 /// changes this fast are smooth to the ear.
-const CONTROL_RATE: usize = 16;
+pub(super) const CONTROL_RATE: usize = 16;
 
 pub struct Biquad {
     kind: FilterKind,
@@ -168,8 +168,16 @@ impl Processor for Biquad {
 
     /// type: 0 lowpass, 1 highpass, 2 bandpass, 3 notch, 4 peak,
     /// 5 low shelf, 6 high shelf. freq in Hz, gain in dB (peak/shelves).
-    fn params(&self) -> &'static [&'static str] {
-        &["type", "freq", "q", "gain"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[
+                ParamInfo::int("type", 0.0, 6.0, 0.0),
+                ParamInfo::log("freq", 10.0, 20_000.0, 1_000.0, "Hz"),
+                ParamInfo::log("q", 0.1, 30.0, std::f32::consts::FRAC_1_SQRT_2, ""),
+                ParamInfo::linear("gain", -30.0, 30.0, 0.0, "dB"),
+            ];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {

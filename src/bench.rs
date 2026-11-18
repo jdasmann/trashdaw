@@ -385,4 +385,75 @@ mod tests {
         let (_, _, on) = reverb_tail(true);
         println!("\n  60 s of reverb tail: {off:.3} s without the guard, {on:.3} s with it ({:.1}x)", off / on);
     }
+
+    /// Step 8, exercise 3: one Eq3 node vs three Biquad nodes.
+    #[test]
+    #[ignore]
+    fn bench_eq_designs() {
+        use crate::buffer::AudioBuffer;
+        use crate::transport::Transport;
+        let _guard = crate::denormal::NoDenormals::new();
+        let ctx = Transport::new(SR as f64).context();
+        let input = noise(BLOCK, 3);
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        let bands = [(5.0, 120.0, q), (4.0, 1_000.0, 1.0), (6.0, 8_000.0, q)];
+
+        // `sweep`: keep moving the mid frequency, so it never settles.
+        let time = |nodes: &mut Vec<Box<dyn Processor>>, sweep: Option<(usize, usize)>| {
+            let mut buf = AudioBuffer::new(2, BLOCK);
+            let blocks = 4000;
+            let mut elapsed = 0.0;
+            for block in 0..blocks + 200 {
+                buf.channel_mut(0).copy_from_slice(&input);
+                buf.channel_mut(1).copy_from_slice(&input);
+                if let Some((node, param)) = sweep {
+                    nodes[node].set_param(param, if block % 2 == 0 { 800.0 } else { 1_200.0 });
+                }
+                let start = Instant::now();
+                for n in nodes.iter_mut() {
+                    n.process(&mut buf, &ctx);
+                }
+                if block >= 200 {
+                    elapsed += start.elapsed().as_secs_f64();
+                }
+            }
+            elapsed * 1e9 / (blocks * BLOCK) as f64
+        };
+        let one = |gains: [f32; 3]| -> Vec<Box<dyn Processor>> {
+            let mut e: Box<dyn Processor> = Box::new(nodes::Eq3::new());
+            e.prepare(&INFO);
+            for (param, g) in [1, 3, 6].into_iter().zip(gains) {
+                e.set_param(param, g);
+            }
+            vec![e]
+        };
+        let three = |gains: [f32; 3]| -> Vec<Box<dyn Processor>> {
+            bands
+                .iter()
+                .zip(gains)
+                .map(|(&(kind, freq, q), g)| {
+                    let mut b: Box<dyn Processor> = Box::new(nodes::Biquad::new());
+                    b.prepare(&INFO);
+                    b.set_param(0, kind);
+                    b.set_param(1, freq);
+                    b.set_param(2, q);
+                    b.set_param(3, g);
+                    b
+                })
+                .collect()
+        };
+        let boost = [4.0, -6.0, 3.0];
+        println!();
+        println!("  {:<34} {:>10} {:>12}", "ns per stereo sample", "one Eq3", "3 Biquads");
+        let rows: [(&str, [f32; 3], Option<(usize, usize)>, Option<(usize, usize)>); 3] = [
+            ("all three bands active, settled", boost, None, None),
+            ("flat (all bands at 0 dB)", [0.0; 3], None, None),
+            ("mid frequency moving", boost, Some((0, 2)), Some((1, 1))),
+        ];
+        for (name, gains, sweep_one, sweep_three) in rows {
+            let a = time(&mut one(gains), sweep_one);
+            let b = time(&mut three(gains), sweep_three);
+            println!("  {name:<34} {a:>10.2} {b:>12.2}");
+        }
+    }
 }

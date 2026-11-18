@@ -1,5 +1,5 @@
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::transport::ProcessContext;
 use crate::smoothing::Smoothed;
 use std::f32::consts::TAU;
@@ -27,8 +27,11 @@ impl Processor for Lowpass {
         "lp"
     }
 
-    fn params(&self) -> &'static [&'static str] {
-        &["cutoff"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[ParamInfo::log("cutoff", 20.0, 20_000.0, 20_000.0, "Hz")];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {

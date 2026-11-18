@@ -1,5 +1,5 @@
 use crate::buffer::AudioBuffer;
-use crate::processor::{PrepareInfo, Processor};
+use crate::processor::{ParamInfo, PrepareInfo, Processor};
 use crate::transport::ProcessContext;
 use crate::smoothing::Smoothed;
 use std::f32::consts::FRAC_PI_4;
@@ -29,8 +29,11 @@ impl Processor for Pan {
         "pan"
     }
 
-    fn params(&self) -> &'static [&'static str] {
-        &["pos"]
+    fn param_info(&self) -> &'static [ParamInfo] {
+        // A `const`: a reference to an array built by (const) function
+        // calls isn't promoted to 'static automatically.
+        const PARAMS: &[ParamInfo] = &[ParamInfo::linear("pos", -1.0, 1.0, 0.0, "")];
+        PARAMS
     }
 
     fn prepare(&mut self, info: &PrepareInfo) {
