@@ -283,7 +283,7 @@ impl DawApp {
         // --- Playhead ---
         let x = view.beat_to_x(playhead);
         if x >= view.origin {
-            painter.line_segment([Pos2::new(x, area.top()), Pos2::new(x, area.bottom())], Stroke::new(1.5, PLAYHEAD));
+            painter.line_segment([Pos2::new(x, area.top()), Pos2::new(x, area.bottom())], Stroke::new(1.5_f32, PLAYHEAD));
         }
         if tracks.is_empty() {
             painter.text(area.center(), Align2::CENTER_CENTER, "Add a track with \"+ Track\" above", FontId::proportional(15.0), Color32::from_gray(140));
@@ -304,7 +304,7 @@ impl DawApp {
         let label_every = (60.0 / (self.timeline.px_per_beat * BEATS_PER_BAR as f32)).ceil().max(1.0) as i64;
         for bar in first_bar..=last_bar {
             let x = view.beat_to_x(bar as f64 * BEATS_PER_BAR);
-            painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, area.bottom())], Stroke::new(1.0, Color32::from_gray(48)));
+            painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, area.bottom())], Stroke::new(1.0_f32, Color32::from_gray(48)));
             if bar % label_every == 0 {
                 painter.text(Pos2::new(x + 3.0, ruler.center().y), Align2::LEFT_CENTER, format!("{}", bar + 1), FontId::proportional(11.0), Color32::from_gray(170));
             }
@@ -324,7 +324,7 @@ impl DawApp {
     fn clip_row(&mut self, ui: &mut Ui, painter: &egui::Painter, view: &View, lane: Rect, header: Rect, track: usize, snapping: bool) {
         let selected = self.selected == Target::Track(track);
         painter.rect_filled(header, Rounding::ZERO, if selected { Color32::from_gray(60) } else { Color32::from_gray(38) });
-        painter.line_segment([lane.left_bottom(), lane.right_bottom()], Stroke::new(1.0, Color32::from_gray(50)));
+        painter.line_segment([lane.left_bottom(), lane.right_bottom()], Stroke::new(1.0_f32, Color32::from_gray(50)));
         let name = self.session.project.tracks[track].as_ref().map(|t| t.name.clone()).unwrap_or_default();
         painter.text(header.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, &name, FontId::proportional(13.0), Color32::from_gray(220));
         if ui.interact(header, Id::new(("header", track)), Sense::click()).clicked() {
@@ -529,7 +529,7 @@ impl DawApp {
         painter.rect_filled(header, Rounding::ZERO, Color32::from_gray(33));
         painter.text(header.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, format!("↳ {label}"), FontId::proportional(11.0), AUTO_LINE);
         painter.rect_filled(rect, Rounding::ZERO, Color32::from_gray(24));
-        painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, Color32::from_gray(50)));
+        painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0_f32, Color32::from_gray(50)));
 
         // The line: flat before the first point and after the last.
         let to_screen = |&(b, v): &(f64, f32)| Pos2::new(view.beat_to_x(b), value_to_y(v, rect));
@@ -540,7 +540,7 @@ impl DawApp {
         }
         let clip_painter = painter.with_clip_rect(rect);
         for w in line.windows(2) {
-            clip_painter.line_segment([w[0], w[1]], Stroke::new(1.5, AUTO_LINE));
+            clip_painter.line_segment([w[0], w[1]], Stroke::new(1.5_f32, AUTO_LINE));
         }
 
         // Background first, points after, so a point wins under the pointer.
@@ -625,7 +625,7 @@ impl DawApp {
                     if hi > lo {
                         painter.line_segment(
                             [Pos2::new(x, mid - hi.min(1.0) * half), Pos2::new(x, mid - lo.max(-1.0) * half)],
-                            Stroke::new(1.0, Color32::from_rgb(170, 200, 240)),
+                            Stroke::new(1.0_f32, Color32::from_rgb(170, 200, 240)),
                         );
                     }
                     x += 1.0;

@@ -133,11 +133,11 @@ fn draw_meter(painter: &egui::Painter, rect: Rect, m: &MeterState) {
     }
     if m.hold_db > FLOOR_DB {
         let hy = y(m.hold_db);
-        painter.line_segment([Pos2::new(rect.left(), hy), Pos2::new(rect.right(), hy)], Stroke::new(1.0, Color32::WHITE));
+        painter.line_segment([Pos2::new(rect.left(), hy), Pos2::new(rect.right(), hy)], Stroke::new(1.0_f32, Color32::WHITE));
     }
     // 0 dB mark, and the clip light at the top.
     let zero = y(0.0);
-    painter.line_segment([Pos2::new(rect.left(), zero), Pos2::new(rect.right(), zero)], Stroke::new(1.0, Color32::from_gray(90)));
+    painter.line_segment([Pos2::new(rect.left(), zero), Pos2::new(rect.right(), zero)], Stroke::new(1.0_f32, Color32::from_gray(90)));
     if m.clipped {
         painter.rect_filled(Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), 4.0)), Rounding::ZERO, Color32::RED);
     }

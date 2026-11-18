@@ -47,6 +47,14 @@ pub enum Command {
 }
 
 /// Things the audio thread is done with, sent back to be freed.
+///
+/// Nothing ever reads these payloads: they exist only so they can be
+/// DROPPED on the main thread, because freeing memory isn't real-time safe
+/// on the audio thread. The compiler rightly notices the fields are never
+/// read, so the warning is silenced on purpose. (Its suggestion, replacing
+/// the fields with `()`, would free them on the audio thread instead:
+/// exactly what this type exists to prevent.)
+#[allow(dead_code)]
 pub enum Garbage {
     Node(Box<dyn Processor>),
     Track(Box<Track>),
