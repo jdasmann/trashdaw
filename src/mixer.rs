@@ -202,7 +202,8 @@ impl Track {
     /// adds the result into `master` and, scaled by the send, into `aux`
     /// (whose windows the caller has set). `live` holds live MIDI for this
     /// window, with frames counted from `live_base`. `key` is the sidechain
-    /// signal for this window, if the track has one.
+    /// signal for this window, if the track has one. `monitor` is live
+    /// input to mix in (before the effects, so you hear them on it).
     #[allow(clippy::too_many_arguments)]
     pub fn render_into(
         &mut self,
@@ -215,6 +216,7 @@ impl Track {
         live: &[(usize, MidiMessage)],
         live_base: usize,
         key: Option<&AudioBuffer>,
+        monitor: Option<(&[f32], &[f32])>,
     ) -> TrackPeaks {
         self.buffer.set_window(offset, n);
         self.buffer.clear();
@@ -236,6 +238,12 @@ impl Track {
         // state (filter memory, oscillator phase) that
         // must keep moving with time, and we can't know whether a chain is
         // silent without running it: a clip might start this very block.
+        if let Some((in_l, in_r)) = monitor {
+            let (l, r) = self.buffer.stereo_mut();
+            for (dst, src) in l.iter_mut().zip(in_l).chain(r.iter_mut().zip(in_r)) {
+                *dst += src;
+            }
+        }
         self.run_chain(ctx, key);
         let (pre_l, pre_r) = self.peaks();
         let pre = pre_l.max(pre_r);

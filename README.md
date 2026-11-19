@@ -19,7 +19,7 @@ step 9 notes if you want to upgrade.
 ## Running
 
     cargo run --release            # the window
-    cargo run --release -- --cli   # the command line from steps 1-8
+    cargo run --release -- --cli   # the command line
 
 In the window:
 
@@ -40,8 +40,19 @@ In the window:
 - Click or drag the **ruler** to move the playhead. **Space** plays and
   stops. **Ctrl + scroll** zooms, **Shift + scroll** scrolls sideways.
 - The mixer (bottom): fader (double-click for 0 dB), meter (click to clear
-  the clip light), pan, **M**ute, **S**olo, **R** to arm for a MIDI
-  keyboard, and the aux send.
+  the clip light), pan, **M**ute, **S**olo, **●** to arm for recording,
+  **R** to arm for a MIDI keyboard, and the aux send.
+- **Recording**: arm a track with **●**, then play. The take lands as a
+  clip when you stop, and is saved in `recordings/`. With a loop, each lap
+  becomes its own take, newest on top. The "Audio input" panel (left)
+  shows the input level, the latency the driver reports, and a manual
+  adjustment for calibrating timing.
+- **Punch in/out**: tick **punch** in the transport bar and set its bars
+  (shown in red on the ruler). Play from earlier to hear the lead-in; only
+  the punch range is recorded, to the exact sample.
+- **Monitor input** (Audio input panel) plays your input through the armed
+  track and its effects. Use headphones: with speakers it can feed back.
+  The panel also measures **clock drift** between input and output.
 
 ## Testing and benchmarks
 
@@ -71,6 +82,7 @@ input, without opening a window.
       buffer.rs      planar audio buffer
       smoothing.rs   parameter smoothing
       loader.rs      audio file decoding (symphonia)
+      record.rs      recording: latency compensation, WAV writer, disk thread
       denormal.rs    flush-to-zero guard for the audio thread
       bench.rs       offline benchmarks (tests only)
       nodes/         effects: filter, eq, delay, comp, reverb, gain, lp,
