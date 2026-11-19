@@ -4,6 +4,7 @@ use super::{widgets, DawApp};
 use crate::automation::AutoTarget;
 use crate::mixer::Target;
 use crate::nodes;
+use std::sync::Arc;
 use crate::session::demo_notes;
 use crate::transport::BEATS_PER_BAR;
 use eframe::egui::{self, Ui};
@@ -53,13 +54,32 @@ impl DawApp {
         let inst = self.session.project.tracks[track].as_ref().and_then(|t| t.instrument.clone());
         ui.horizontal(|ui| {
             ui.strong("Instrument");
-            let mut on = inst.is_some();
-            if ui.checkbox(&mut on, "synth").changed() {
-                let r = self.session.set_synth(track, on);
-                self.report(r);
-            }
+            let current = inst.as_ref().map_or("none", |i| i.name);
+            let instruments: Vec<_> = self.session.plugins.iter().filter(|p| p.descriptor.is_instrument()).cloned().collect();
+            egui::ComboBox::from_id_source(("instrument", track)).selected_text(current).show_ui(ui, |ui| {
+                if ui.selectable_label(inst.is_none(), "none").clicked() {
+                    let r = self.session.set_synth(track, false);
+                    self.report(r);
+                }
+                if ui.selectable_label(current == "synth", "Synth (built in)").clicked() {
+                    let r = self.session.set_synth(track, true);
+                    self.report(r);
+                }
+                if !instruments.is_empty() {
+                    ui.separator();
+                }
+                for p in instruments {
+                    if ui.selectable_label(false, format!("{} (CLAP)", p.descriptor.name)).clicked() {
+                        let r = self.session.set_plugin_instrument(track, &p.path, &p.descriptor.id);
+                        self.report(r);
+                    }
+                }
+            });
         });
         let Some(inst) = inst else { return };
+        if let Some(p) = &inst.plugin {
+            self.plugin_status(ui, p);
+        }
         if ui.button("+ demo MIDI clip at playhead").clicked() {
             let bar = (self.session.current_beat() / BEATS_PER_BAR).floor() * BEATS_PER_BAR;
             let r = self.session.add_midi_clip(track, bar, 4.0 * BEATS_PER_BAR, demo_notes()).map(|_| ());
@@ -135,7 +155,11 @@ impl DawApp {
         let slots = self.session.project.get(target).map(|t| t.slots.clone()).unwrap_or_default();
         for (slot, node) in slots.iter().enumerate() {
             let Some(node) = node else { continue };
-            egui::CollapsingHeader::new(format!("{slot}: {}", node.name)).id_source(("slot", target, slot)).default_open(true).show(ui, |ui| {
+            let title = if node.plugin.is_some() { format!("{slot}: {} (CLAP)", node.name) } else { format!("{slot}: {}", node.name) };
+            egui::CollapsingHeader::new(title).id_source(("slot", target, slot)).default_open(true).show(ui, |ui| {
+                if let Some(p) = &node.plugin {
+                    self.plugin_status(ui, p);
+                }
                 for (i, p) in node.params.iter().enumerate() {
                     if let Some(v) = widgets::param(ui, node.name, p, node.values[i], ("param", target, slot, i)) {
                         let r = self.session.set_param(target, slot, i, v);
@@ -148,6 +172,7 @@ impl DawApp {
                 }
             });
         }
+        let plugin_effects: Vec<_> = self.session.plugins.iter().filter(|p| !p.descriptor.is_instrument()).cloned().collect();
         egui::ComboBox::from_id_source(("add effect", target)).selected_text("+ add effect").show_ui(ui, |ui| {
             for (kind, label) in nodes::KINDS {
                 if ui.selectable_label(false, *label).clicked() {
@@ -155,6 +180,35 @@ impl DawApp {
                     self.report(r);
                 }
             }
+            if !plugin_effects.is_empty() {
+                ui.separator();
+            }
+            for p in plugin_effects {
+                if ui.selectable_label(false, format!("{} (CLAP)", p.descriptor.name)).clicked() {
+                    let r = self.session.add_plugin(target, &p.path, &p.descriptor.id, None).map(|_| ());
+                    self.report(r);
+                }
+            }
         });
+    }
+
+    /// A plugin's health: missing, failed, or how much of the time budget
+    /// it uses. That's all a host can know about someone else's code.
+    fn plugin_status(&mut self, ui: &mut Ui, p: &crate::project::PluginInfo) {
+        let Some(inst) = &p.instance else {
+            ui.colored_label(egui::Color32::from_rgb(230, 120, 60), format!("missing: {} (saving keeps it)", p.path.display()));
+            return;
+        };
+        if inst.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            ui.colored_label(egui::Color32::from_rgb(230, 60, 50), "the plugin reported an error: bypassed");
+            return;
+        }
+        // Peak since last frame, held and decayed so it's readable.
+        let key = Arc::as_ptr(inst) as usize;
+        let shown = self.plugin_cpu.entry(key).or_insert(0.0);
+        *shown = inst.take_cpu().max(*shown * 0.97);
+        let pct = *shown * 100.0;
+        let color = if pct > 50.0 { egui::Color32::from_rgb(230, 120, 60) } else { egui::Color32::GRAY };
+        ui.small(egui::RichText::new(format!("CPU {pct:.1}% of the block budget")).color(color));
     }
 }

@@ -256,11 +256,13 @@ pub fn spawn_writer(mut events: Consumer<RecEvent>, dir: PathBuf, sample_rate: u
                                 }
                             }
                             let name = t.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                            let audio = Arc::new(AudioData { name, sample_rate: sample_rate as f64, channels: vec![t.left, t.right] });
                             let path = match error {
                                 None => Ok(t.path),
                                 Some(e) => Err(e),
                             };
+                            // Remember the file, unless writing it failed.
+                            let file = path.as_ref().ok().cloned();
+                            let audio = Arc::new(AudioData { name, path: file, sample_rate: sample_rate as f64, channels: vec![t.left, t.right] });
                             let _ = done.send(Finished { take: t.take, track: t.track, start_frame: t.start_frame, path, audio });
                         }
                     }

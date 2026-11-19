@@ -7,11 +7,14 @@ use crate::clip::ClipParams;
 use crate::loader::AudioData;
 use crate::midi::Note;
 use crate::mixer::{Target, MAX_SLOTS, MAX_TRACKS};
+use crate::clap::Instance;
 use crate::processor::ParamInfo;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The main thread's copy of a clip. This is the editable one; the engine
 /// gets rebuilt `AudioClip`s from it after every change.
+#[derive(Clone, Debug)]
 pub struct ClipInfo {
     pub data: Arc<AudioData>,
     pub params: ClipParams,
@@ -25,17 +28,61 @@ pub struct NodeInfo {
     pub name: &'static str,
     pub params: &'static [ParamInfo],
     pub values: Vec<f32>,
+    /// Set for CLAP plugins: where it came from, and the instance itself.
+    pub plugin: Option<PluginInfo>,
+}
+
+/// A plugin node's identity. The instance is shared with the engine's node
+/// (and with undo snapshots, so undoing "remove plugin" brings back the
+/// SAME instance, with all its internal state).
+#[derive(Clone)]
+pub struct PluginInfo {
+    pub path: PathBuf,
+    pub id: String,
+    /// None if the plugin couldn't be loaded: a placeholder that keeps its
+    /// saved state, so saving again doesn't lose it.
+    pub instance: Option<Arc<Instance>>,
+    /// State from the project file, for a placeholder.
+    pub state: Option<Arc<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for PluginInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginInfo").field("path", &self.path).field("id", &self.id).field("loaded", &self.instance.is_some()).finish()
+    }
+}
+
+impl PluginInfo {
+    /// The same plugin instance (or both missing, with the same identity)?
+    pub fn same(&self, other: &PluginInfo) -> bool {
+        self.id == other.id
+            && match (&self.instance, &other.instance) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => self.path == other.path,
+                _ => false,
+            }
+    }
 }
 
 impl NodeInfo {
     /// Starts every value at its declared default, which a test guarantees
     /// matches the node's real initial state.
     pub fn new(name: &'static str, params: &'static [ParamInfo]) -> Self {
-        Self { name, params, values: params.iter().map(|p| p.default).collect() }
+        Self { name, params, values: params.iter().map(|p| p.default).collect(), plugin: None }
     }
 
     pub fn param_index(&self, name: &str) -> Option<usize> {
         self.params.iter().position(|p| p.name == name)
+    }
+
+    /// The same node: the same kind, and for plugins the same instance.
+    pub fn same_node(&self, other: &NodeInfo) -> bool {
+        self.name == other.name
+            && match (&self.plugin, &other.plugin) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same(b),
+                _ => false,
+            }
     }
 }
 
@@ -43,6 +90,7 @@ pub type SlotInfo = Option<NodeInfo>;
 
 /// A MIDI clip: notes relative to the clip's start. Only the main thread
 /// sees clips; the engine gets them flattened into a `Sequence`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MidiClipInfo {
     pub id: u32,
     pub start_beat: f64,
@@ -52,12 +100,13 @@ pub struct MidiClipInfo {
 
 /// An automation lane in the project: what it controls, and breakpoints
 /// as (beat, normalized 0..1 value).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AutoLaneInfo {
     pub target: AutoTarget,
     pub points: Vec<(f64, f32)>,
 }
 
+#[derive(Clone, Debug)]
 pub struct TrackInfo {
     /// Names only live here. The engine has no use for them.
     pub name: String,
@@ -100,10 +149,16 @@ impl TrackInfo {
     }
 }
 
+/// The whole song: everything that is saved, and everything undo covers.
+/// Cheap to clone, because audio is shared through `Arc`s: a snapshot
+/// copies the structure, never the samples.
+#[derive(Clone, Debug)]
 pub struct Project {
     pub tracks: Vec<Option<TrackInfo>>,
     pub aux: TrackInfo,
     pub master: TrackInfo,
+    pub tempo: f64,
+    pub loop_range: Option<(f64, f64)>,
 }
 
 impl Project {
@@ -112,6 +167,8 @@ impl Project {
             tracks: (0..MAX_TRACKS).map(|_| None).collect(),
             aux: TrackInfo::new("Aux".into()),
             master: TrackInfo::new("Master".into()),
+            tempo: 120.0,
+            loop_range: None,
         }
     }
 

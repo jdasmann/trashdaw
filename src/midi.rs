@@ -91,7 +91,7 @@ pub struct LiveMidi {
 }
 
 /// A note inside a MIDI clip, relative to the clip's start (in beats).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Note {
     pub start: f64,
     pub length: f64,

@@ -185,6 +185,17 @@ impl Track {
         }
     }
 
+    /// Audio thread: lets every node and the instrument stop processing,
+    /// before the whole track is sent back to be freed.
+    pub fn stop_all(&mut self) {
+        for node in self.slots.iter_mut().flatten() {
+            node.stop();
+        }
+        if let Some(inst) = self.instrument.as_mut() {
+            inst.stop();
+        }
+    }
+
     /// The track's own buffer: after its chain, before its fader. This is
     /// where a sidechain is tapped from.
     pub fn output(&self) -> &AudioBuffer {

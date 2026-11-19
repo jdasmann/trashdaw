@@ -17,8 +17,24 @@ pub type LoadError = Box<dyn std::error::Error + Send + Sync>;
 /// without copying.
 pub struct AudioData {
     pub name: String,
+    /// Where it came from on disk, if anywhere: what a project file saves.
+    pub path: Option<std::path::PathBuf>,
     pub sample_rate: f64,
     pub channels: Vec<Vec<f32>>,
+}
+
+/// A summary, not the samples: a derived `Debug` would print millions of
+/// numbers.
+impl std::fmt::Debug for AudioData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioData")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("sample_rate", &self.sample_rate)
+            .field("frames", &self.frames())
+            .field("channels", &self.channels.len())
+            .finish()
+    }
 }
 
 impl AudioData {
@@ -106,7 +122,7 @@ pub fn load_audio(path: &Path) -> Result<AudioData, LoadError> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "untitled".into());
 
-    Ok(AudioData { name, sample_rate, channels })
+    Ok(AudioData { name, path: Some(path.to_path_buf()), sample_rate, channels })
 }
 
 #[cfg(test)]

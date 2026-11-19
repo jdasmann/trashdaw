@@ -80,6 +80,11 @@ pub trait Processor: Send {
         let _ = key;
         self.process(buffer, ctx);
     }
+
+    /// Audio thread, just before the node leaves the engine (it's then
+    /// freed on the main thread). Plugins must stop processing on the
+    /// audio thread; built-in nodes have nothing to do.
+    fn stop(&mut self) {}
 }
 
 /// A sound source driven by MIDI. Separate from `Processor` because it
@@ -95,4 +100,7 @@ pub trait Instrument: Send {
     /// Audio thread. Adds into `buffer`. `events` are sorted by frame,
     /// relative to the start of the buffer's current window.
     fn render(&mut self, buffer: &mut AudioBuffer, ctx: &ProcessContext, events: &[crate::midi::MidiEvent]);
+
+    /// Audio thread, just before the instrument leaves the engine.
+    fn stop(&mut self) {}
 }

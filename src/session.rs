@@ -23,6 +23,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
+mod file;
+mod plugins;
+mod undo;
+
+pub use plugins::PluginEntry;
+
+pub use file::EXTENSION as PROJECT_EXTENSION;
+pub use undo::History;
+
 pub type Result<T = ()> = std::result::Result<T, String>;
 
 /// Bars are 1-based for humans; beats are 0-based for the engine.
@@ -47,8 +56,6 @@ pub struct Session {
     /// Jump back to where playback began when stopping.
     pub return_to_start: bool,
     play_start: Option<f64>,
-    /// Mirrors of transport state the engine doesn't publish.
-    pub loop_range: Option<(f64, f64)>,
     pub armed: Option<usize>,
     // Live MIDI: the driver's thread pushes into this, the audio thread
     // pops. Behind a Mutex so it can be handed to whichever connection is
@@ -61,6 +68,14 @@ pub struct Session {
     pub rec_track: Option<usize>,
     /// Manual latency adjustment in milliseconds (see `record::take_start`).
     pub latency_adjust_ms: f64,
+    /// Undo and redo, and whether there are unsaved changes.
+    pub history: History,
+    /// The file this project was last saved to or opened from.
+    pub project_path: Option<PathBuf>,
+    /// Plugins found on disk (see `scan_plugins`).
+    pub plugins: Vec<PluginEntry>,
+    /// Each plugin library, loaded once and shared by its instances.
+    bundles: std::collections::HashMap<PathBuf, Arc<crate::clap::Bundle>>,
     /// Record only inside this range (beats).
     pub punch: Option<(f64, f64)>,
     pub monitor: bool,
@@ -96,13 +111,16 @@ impl Session {
             next_clip_id: 1,
             return_to_start: true,
             play_start: None,
-            loop_range: None,
             armed: None,
             live_tx: Arc::new(Mutex::new(live_tx)),
             midi_conn: None,
             recorder: None,
             rec_track: None,
             latency_adjust_ms: 0.0,
+            history: History::default(),
+            project_path: None,
+            plugins: Vec::new(),
+            bundles: std::collections::HashMap::new(),
             punch: None,
             monitor: false,
             drift: DriftEstimator::default(),
@@ -179,7 +197,16 @@ impl Session {
             }
             None => return Vec::new(),
         };
-        finished.into_iter().map(|f| self.place_take(f)).collect()
+        finished
+            .into_iter()
+            .map(|f| {
+                // A recorded take is an edit like any other: it can be undone.
+                let before = self.project.clone();
+                let msg = self.place_take(f);
+                self.history.record("record take", before, None);
+                msg
+            })
+            .collect()
     }
 
     fn place_take(&mut self, f: Finished) -> String {
@@ -226,6 +253,7 @@ impl Session {
         while let Ok(item) = self.garbage.pop() {
             drop(item); // nodes, tracks, clip lists... freed here, safely
         }
+        self.service_plugins();
     }
 
     /// Messages from background work since the last call.
@@ -250,8 +278,10 @@ impl Session {
         self.shared.playing()
     }
 
+    /// The project's tempo. (The engine publishes its own copy too, which
+    /// lags by a callback after a change; the project's is authoritative.)
     pub fn tempo(&self) -> f64 {
-        self.shared.tempo()
+        self.project.tempo
     }
 
     pub fn play(&mut self) -> Result {
@@ -289,22 +319,25 @@ impl Session {
         self.send(Command::Seek { beat })
     }
 
-    pub fn set_tempo(&mut self, bpm: f64) -> Result {
+    fn set_tempo_inner(&mut self, bpm: f64) -> Result {
         if !(20.0..=999.0).contains(&bpm) {
             return Err("tempo must be 20-999 BPM".into());
         }
-        self.send(Command::SetTempo { bpm })
+        self.send(Command::SetTempo { bpm })?;
+        self.project.tempo = bpm;
+        Ok(())
     }
 
     /// A loop in beats, or `None` for no loop.
-    pub fn set_loop(&mut self, range: Option<(f64, f64)>) -> Result {
+    fn set_loop_inner(&mut self, range: Option<(f64, f64)>) -> Result {
         if let Some((start, end)) = range {
             if start < 0.0 || end <= start {
                 return Err("the loop must end after it starts".into());
             }
         }
-        self.loop_range = range;
-        self.send(Command::SetLoop { range })
+        self.send(Command::SetLoop { range })?;
+        self.project.loop_range = range;
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -323,7 +356,7 @@ impl Session {
         self.project.get_mut(target).ok_or_else(|| format!("no such target: {target:?}"))
     }
 
-    pub fn add_track(&mut self, name: Option<String>) -> Result<usize> {
+    fn add_track_inner(&mut self, name: Option<String>) -> Result<usize> {
         let index = self.project.first_free_track().ok_or_else(|| format!("all {MAX_TRACKS} tracks in use"))?;
         let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("Track {}", index + 1));
         // The track's buffers are allocated here, not in the engine.
@@ -333,7 +366,7 @@ impl Session {
         Ok(index)
     }
 
-    pub fn remove_track(&mut self, index: usize) -> Result {
+    fn remove_track_inner(&mut self, index: usize) -> Result {
         self.track_info(index)?;
         self.send(Command::RemoveTrack { index })?;
         self.project.tracks[index] = None;
@@ -353,12 +386,12 @@ impl Session {
         Ok(())
     }
 
-    pub fn rename_track(&mut self, track: usize, name: String) -> Result {
+    fn rename_track_inner(&mut self, track: usize, name: String) -> Result {
         self.track_info_mut(track)?.name = name;
         Ok(())
     }
 
-    pub fn set_volume(&mut self, target: Target, db: f32) -> Result {
+    fn set_volume_inner(&mut self, target: Target, db: f32) -> Result {
         let db = db.clamp(-60.0, 12.0);
         self.target_info_mut(target)?;
         self.send(Command::SetVolume { target, db })?;
@@ -366,7 +399,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn set_pan(&mut self, track: usize, pos: f32) -> Result {
+    fn set_pan_inner(&mut self, track: usize, pos: f32) -> Result {
         let pos = pos.clamp(-1.0, 1.0);
         self.track_info(track)?;
         self.send(Command::SetPan { track, pos })?;
@@ -374,21 +407,21 @@ impl Session {
         Ok(())
     }
 
-    pub fn set_mute(&mut self, track: usize, on: bool) -> Result {
+    fn set_mute_inner(&mut self, track: usize, on: bool) -> Result {
         self.track_info(track)?;
         self.send(Command::SetMute { track, on })?;
         self.track_info_mut(track)?.mute = on;
         Ok(())
     }
 
-    pub fn set_solo(&mut self, track: usize, on: bool) -> Result {
+    fn set_solo_inner(&mut self, track: usize, on: bool) -> Result {
         self.track_info(track)?;
         self.send(Command::SetSolo { track, on })?;
         self.track_info_mut(track)?.solo = on;
         Ok(())
     }
 
-    pub fn set_send(&mut self, track: usize, db: f32) -> Result {
+    fn set_send_inner(&mut self, track: usize, db: f32) -> Result {
         let db = db.clamp(-60.0, 12.0);
         self.track_info(track)?;
         self.send(Command::SetSend { track, db })?;
@@ -396,7 +429,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn set_sidechain(&mut self, track: usize, source: Option<usize>) -> Result {
+    fn set_sidechain_inner(&mut self, track: usize, source: Option<usize>) -> Result {
         self.track_info(track)?;
         if let Some(s) = source {
             self.track_info(s)?;
@@ -414,7 +447,7 @@ impl Session {
     // ---------------------------------------------------------------
 
     /// Adds an effect; returns the slot it went into.
-    pub fn add_node(&mut self, target: Target, kind: &str, slot: Option<usize>) -> Result<usize> {
+    fn add_node_inner(&mut self, target: Target, kind: &str, slot: Option<usize>) -> Result<usize> {
         let mut node = nodes::make(kind).ok_or_else(|| format!("unknown effect kind: {kind}"))?;
         let slot = match slot {
             Some(s) if s < MAX_SLOTS => s,
@@ -432,7 +465,7 @@ impl Session {
         Ok(slot)
     }
 
-    pub fn remove_node(&mut self, target: Target, slot: usize) -> Result {
+    fn remove_node_inner(&mut self, target: Target, slot: usize) -> Result {
         let t = self.target_info_mut(target)?;
         if t.slots.get(slot).map_or(true, |s| s.is_none()) {
             return Err("that slot is empty".into());
@@ -444,7 +477,7 @@ impl Session {
         self.drop_lanes(target, |t| matches!(t, AutoTarget::Node { slot: s, .. } if s == slot))
     }
 
-    pub fn set_param(&mut self, target: Target, slot: usize, param: usize, value: f32) -> Result {
+    fn set_param_inner(&mut self, target: Target, slot: usize, param: usize, value: f32) -> Result {
         let node = self
             .target_info_mut(target)?
             .slots
@@ -477,7 +510,7 @@ impl Session {
     // Instruments
     // ---------------------------------------------------------------
 
-    pub fn set_synth(&mut self, track: usize, on: bool) -> Result {
+    fn set_synth_inner(&mut self, track: usize, on: bool) -> Result {
         self.track_info(track)?;
         let instrument: Option<Box<dyn Instrument>> = if on {
             let mut synth: Box<dyn Instrument> = Box::new(Synth::new());
@@ -493,7 +526,7 @@ impl Session {
         self.drop_lanes(Target::Track(track), |t| matches!(t, AutoTarget::Instrument { .. }))
     }
 
-    pub fn set_instrument_param(&mut self, track: usize, param: usize, value: f32) -> Result {
+    fn set_instrument_param_inner(&mut self, track: usize, param: usize, value: f32) -> Result {
         let inst = self.track_info(track)?.instrument.as_ref().ok_or("that track has no instrument")?;
         let p = inst.params.get(param).ok_or("no such parameter")?;
         let value = value.clamp(p.min, p.max);
@@ -547,9 +580,15 @@ impl Session {
     /// after every clip edit: building a fresh snapshot on this thread is
     /// simpler and safer than editing the engine's list in place.
     fn sync_clips(&mut self, track: usize) -> Result {
-        let t = self.track_info(track)?;
+        let clips = self.build_clips(self.track_info(track)?);
+        self.send(Command::SetClips { track, clips })
+    }
+
+    /// The engine's clip list for a track, built from the project. Shared by
+    /// edits and by the reconciler (undo, redo, loading).
+    fn build_clips(&self, t: &TrackInfo) -> Box<ClipList> {
         let clips = t.clips.iter().map(|c| AudioClip::new(c.data.clone(), c.params, &self.info)).collect();
-        self.send(Command::SetClips { track, clips: Box::new(ClipList::new(clips)) })
+        Box::new(ClipList::new(clips))
     }
 
     fn new_clip_id(&mut self) -> u32 {
@@ -560,7 +599,7 @@ impl Session {
 
     /// Places sample `sample` (an index into the library) on a track at
     /// `start_beat`. Returns the new clip's id.
-    pub fn add_clip(&mut self, track: usize, sample: usize, start_beat: f64) -> Result<u32> {
+    fn add_clip_inner(&mut self, track: usize, sample: usize, start_beat: f64) -> Result<u32> {
         self.track_info(track)?;
         let data = self.library.lock().unwrap().get(sample).cloned().ok_or_else(|| format!("no sample #{sample}"))?;
         // Clips always have an explicit length: the whole file, in beats at
@@ -573,7 +612,7 @@ impl Session {
         Ok(id)
     }
 
-    pub fn remove_clip(&mut self, track: usize, id: u32) -> Result {
+    fn remove_clip_inner(&mut self, track: usize, id: u32) -> Result {
         let clips = &mut self.track_info_mut(track)?.clips;
         let before = clips.len();
         clips.retain(|c| c.params.id != id);
@@ -589,7 +628,7 @@ impl Session {
 
     /// Edits a clip's parameters; `edit` gets a copy, which is validated
     /// before it's kept.
-    pub fn edit_clip(&mut self, track: usize, id: u32, edit: impl FnOnce(&mut ClipParams)) -> Result {
+    fn edit_clip_inner(&mut self, track: usize, id: u32, edit: impl FnOnce(&mut ClipParams)) -> Result {
         let clip = self
             .track_info_mut(track)?
             .clips
@@ -608,7 +647,7 @@ impl Session {
     }
 
     /// Splits a clip at `at_beat`; returns the id of the new second half.
-    pub fn split_clip(&mut self, track: usize, id: u32, at_beat: f64) -> Result<u32> {
+    fn split_clip_inner(&mut self, track: usize, id: u32, at_beat: f64) -> Result<u32> {
         let tempo = self.tempo();
         let new_id = self.next_clip_id;
         let clips = &mut self.track_info_mut(track)?.clips;
@@ -642,12 +681,11 @@ impl Session {
 
     /// Flattens a track's MIDI clips into one note timeline for the engine.
     fn sync_sequence(&mut self, track: usize) -> Result {
-        let t = self.track_info(track)?;
-        let sequence = Sequence::build(t.midi_clips.iter().map(|c| (c.start_beat, c.length_beats, &c.notes[..])));
-        self.send(Command::SetSequence { track, sequence: Box::new(sequence) })
+        let sequence = build_sequence(self.track_info(track)?);
+        self.send(Command::SetSequence { track, sequence })
     }
 
-    pub fn add_midi_clip(&mut self, track: usize, start_beat: f64, length_beats: f64, notes: Vec<Note>) -> Result<u32> {
+    fn add_midi_clip_inner(&mut self, track: usize, start_beat: f64, length_beats: f64, notes: Vec<Note>) -> Result<u32> {
         self.track_info(track)?;
         if start_beat < 0.0 || length_beats <= 0.0 {
             return Err("invalid clip position or length".into());
@@ -658,7 +696,7 @@ impl Session {
         Ok(id)
     }
 
-    pub fn remove_midi_clip(&mut self, track: usize, id: u32) -> Result {
+    fn remove_midi_clip_inner(&mut self, track: usize, id: u32) -> Result {
         let clips = &mut self.track_info_mut(track)?.midi_clips;
         let before = clips.len();
         clips.retain(|c| c.id != id);
@@ -669,7 +707,7 @@ impl Session {
     }
 
     /// Edits a MIDI clip (move it, resize it, change its notes).
-    pub fn edit_midi_clip(&mut self, track: usize, id: u32, edit: impl FnOnce(&mut MidiClipInfo)) -> Result {
+    fn edit_midi_clip_inner(&mut self, track: usize, id: u32, edit: impl FnOnce(&mut MidiClipInfo)) -> Result {
         let clip = self
             .track_info_mut(track)?
             .midi_clips
@@ -693,7 +731,7 @@ impl Session {
     /// Moves an audio clip to another track (and/or time) as ONE action:
     /// everything is checked before anything changes, so a failure can't
     /// leave the clip deleted from one track and missing from the other.
-    pub fn move_clip(&mut self, from: usize, id: u32, to: usize, start_beat: f64) -> Result {
+    fn move_clip_inner(&mut self, from: usize, id: u32, to: usize, start_beat: f64) -> Result {
         self.track_info(to)?;
         if start_beat < 0.0 {
             return Err("can't move before the start".into());
@@ -711,7 +749,7 @@ impl Session {
     }
 
     /// The MIDI-clip version of `move_clip`.
-    pub fn move_midi_clip(&mut self, from: usize, id: u32, to: usize, start_beat: f64) -> Result {
+    fn move_midi_clip_inner(&mut self, from: usize, id: u32, to: usize, start_beat: f64) -> Result {
         self.track_info(to)?;
         if start_beat < 0.0 {
             return Err("can't move before the start".into());
@@ -734,7 +772,13 @@ impl Session {
 
     /// What a lane on `track` would control: its range and scale.
     pub fn automation_info(&self, track: usize, target: AutoTarget) -> Result<ParamInfo> {
-        let t = self.track_info(track)?;
+        lane_info(self.track_info(track)?, target)
+    }
+}
+
+/// What a lane controls on a track: its range and scale.
+fn lane_info(t: &TrackInfo, target: AutoTarget) -> Result<ParamInfo> {
+    {
         match target {
             AutoTarget::Volume => Ok(VOLUME_INFO),
             AutoTarget::Pan => Ok(PAN_INFO),
@@ -753,7 +797,24 @@ impl Session {
                 .ok_or_else(|| "no such instrument parameter".into()),
         }
     }
+}
 
+/// The engine's note timeline for a track, built from the project.
+fn build_sequence(t: &TrackInfo) -> Box<Sequence> {
+    Box::new(Sequence::build(t.midi_clips.iter().map(|c| (c.start_beat, c.length_beats, &c.notes[..]))))
+}
+
+/// The engine's automation for a track, built from the project.
+fn build_automation(t: &TrackInfo) -> Result<Box<AutomationSet>> {
+    let mut set = AutomationSet::default();
+    for lane in &t.automation {
+        let info = lane_info(t, lane.target)?;
+        set.lanes.push(Lane::new(lane.target, info, Envelope::new(lane.points.clone())));
+    }
+    Ok(Box::new(set))
+}
+
+impl Session {
     /// The parameter's current (manual) value, to start a new lane from.
     fn current_value(&self, track: usize, target: AutoTarget) -> Result<f32> {
         let t = self.track_info(track)?;
@@ -767,7 +828,7 @@ impl Session {
 
     /// Adds a lane for `target` (or finds the existing one); returns its
     /// index. A new lane starts flat at the parameter's current value.
-    pub fn add_automation(&mut self, track: usize, target: AutoTarget) -> Result<usize> {
+    fn add_automation_inner(&mut self, track: usize, target: AutoTarget) -> Result<usize> {
         let info = self.automation_info(track, target)?;
         if let Some(i) = self.track_info(track)?.automation.iter().position(|l| l.target == target) {
             return Ok(i);
@@ -780,7 +841,7 @@ impl Session {
         Ok(index)
     }
 
-    pub fn set_automation_points(&mut self, track: usize, lane: usize, points: Vec<(f64, f32)>) -> Result {
+    fn set_automation_points_inner(&mut self, track: usize, lane: usize, points: Vec<(f64, f32)>) -> Result {
         let mut points: Vec<(f64, f32)> = points.into_iter().map(|(b, v)| (b.max(0.0), v.clamp(0.0, 1.0))).collect();
         points.sort_by(|a, b| a.0.total_cmp(&b.0));
         let lanes = &mut self.track_info_mut(track)?.automation;
@@ -788,7 +849,7 @@ impl Session {
         self.sync_automation(track)
     }
 
-    pub fn remove_automation(&mut self, track: usize, lane: usize) -> Result {
+    fn remove_automation_inner(&mut self, track: usize, lane: usize) -> Result {
         let lanes = &mut self.track_info_mut(track)?.automation;
         if lane >= lanes.len() {
             return Err("no such automation lane".into());
@@ -810,13 +871,8 @@ impl Session {
 
     /// Builds the engine's snapshot of a track's lanes and sends it.
     fn sync_automation(&mut self, track: usize) -> Result {
-        let lanes = self.track_info(track)?.automation.clone();
-        let mut set = AutomationSet::default();
-        for lane in lanes {
-            let info = self.automation_info(track, lane.target)?;
-            set.lanes.push(Lane::new(lane.target, info, Envelope::new(lane.points)));
-        }
-        self.send(Command::SetAutomation { track, automation: Box::new(set) })
+        let automation = build_automation(self.track_info(track)?)?;
+        self.send(Command::SetAutomation { track, automation })
     }
 
     // ---------------------------------------------------------------
@@ -974,7 +1030,7 @@ pub mod tests {
         pub fn add_sample(&self, seconds: f64) -> usize {
             let frames = (seconds * 48_000.0) as usize;
             let mut lib = self.session.library.lock().unwrap();
-            lib.push(Arc::new(AudioData { name: "s".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; frames]] }));
+            lib.push(Arc::new(AudioData { path: None, name: "s".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; frames]] }));
             lib.len() - 1
         }
     }
@@ -1134,7 +1190,7 @@ pub mod tests {
 
     fn finished(track: usize, start_frame: i64, seconds: f64) -> Finished {
         let frames = (seconds * 48_000.0) as usize;
-        let audio = Arc::new(AudioData { name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; frames]; 2] });
+        let audio = Arc::new(AudioData { path: None, name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; frames]; 2] });
         Finished { take: 1, track, start_frame, path: Ok(PathBuf::from("recordings/take-001.wav")), audio }
     }
 

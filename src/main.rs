@@ -2,6 +2,7 @@
 mod bench;
 mod automation;
 mod buffer;
+mod clap;
 mod cli;
 mod clip;
 mod denormal;
