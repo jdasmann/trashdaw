@@ -1,6 +1,7 @@
 use crate::buffer::AudioBuffer;
 use crate::automation::AutomationSet;
 use crate::clip::ClipList;
+use crate::record::{take_start, RecEvent, RecordShared, CHUNK};
 use crate::midi::{LiveMidi, MidiMessage, Sequence, SUSTAIN_PEDAL};
 use crate::mixer::{MeterPoint, Meters, Target, Track, MAX_TRACKS, MIX_CHANNELS};
 use crate::processor::{Instrument, PrepareInfo, Processor};
@@ -25,6 +26,14 @@ pub enum Command {
     SetInstrumentParam { track: usize, param: usize, value: f32 },
     /// Which track receives live MIDI input.
     Arm { track: Option<usize> },
+    /// The track that records from the input (None = not armed).
+    SetRecordTrack { track: Option<usize> },
+    /// Manual latency compensation, in frames, added to what the driver reports.
+    SetLatencyAdjust { frames: i64 },
+    /// Record only inside this range of beats (None = everywhere).
+    SetPunch { range: Option<(f64, f64)> },
+    /// Hear the input through the armed track.
+    SetMonitor { on: bool },
     /// Which track's signal `track`'s nodes may listen to (sidechain).
     SetSidechain { track: usize, source: Option<usize> },
     /// The node arrives already constructed and prepared. Moving a Box
@@ -100,6 +109,124 @@ pub struct Engine {
     /// sidesteps borrowing two tracks at once, and costs very little.
     key_buffers: Vec<AudioBuffer>,
     is_key_source: [bool; MAX_TRACKS],
+    // --- Recording ---
+    input: Option<Input>,
+    rec_track: Option<usize>,
+    take: Option<TakeState>,
+    next_take: u32,
+    latency_adjust: i64,
+    /// Punch range in beats: record only inside it.
+    punch: Option<(f64, f64)>,
+    monitor: bool,
+    monitor_fifo: MonitorFifo,
+    monitor_l: Vec<f32>,
+    monitor_r: Vec<f32>,
+}
+
+/// The input side, wired up only when there's an input device.
+struct Input {
+    /// Interleaved samples from the input callback.
+    samples: Consumer<f32>,
+    channels: usize,
+    recorder: Producer<RecEvent>,
+    shared: Arc<RecordShared>,
+    /// The chunk being filled for the disk writer.
+    left: [f32; CHUNK],
+    right: [f32; CHUNK],
+    len: usize,
+}
+
+impl Input {
+    /// Never blocks: if the disk writer has fallen behind, drop and count.
+    fn send(&mut self, ev: RecEvent) {
+        if self.recorder.push(ev).is_err() {
+            self.shared.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            let ev = RecEvent::Samples { len: self.len, left: self.left, right: self.right };
+            self.send(ev);
+            self.len = 0;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TakeState {
+    id: u32,
+    track: usize,
+    /// Where the transport should be at the next callback if time is
+    /// continuous. A loop wrap or seek ends the take and starts a new one.
+    expected: u64,
+    /// The timeline position of the take's next frame.
+    next_pos: i64,
+}
+
+/// Sends the partly filled chunk to the disk writer, if there is one.
+fn flush_chunk(recorder: &mut Producer<RecEvent>, shared: &RecordShared, left: &[f32; CHUNK], right: &[f32; CHUNK], len: &mut usize) {
+    if *len > 0 {
+        if recorder.push(RecEvent::Samples { len: *len, left: *left, right: *right }).is_err() {
+            shared.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        *len = 0;
+    }
+}
+
+/// Live input on its way to the armed track, for monitoring. Input arrives
+/// in bursts that don't line up with output blocks, so it waits here: a
+/// fixed-size ring (no allocation) of stereo frames.
+struct MonitorFifo {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    read: usize,
+    len: usize,
+}
+
+impl MonitorFifo {
+    fn new(capacity: usize) -> Self {
+        Self { left: vec![0.0; capacity], right: vec![0.0; capacity], read: 0, len: 0 }
+    }
+
+    fn push(&mut self, l: f32, r: f32) {
+        let cap = self.left.len();
+        if self.len == cap {
+            // Full: drop the oldest frame rather than grow the delay.
+            self.read = (self.read + 1) % cap;
+            self.len -= 1;
+        }
+        let write = (self.read + self.len) % cap;
+        self.left[write] = l;
+        self.right[write] = r;
+        self.len += 1;
+    }
+
+    /// Fills `l` and `r` with the oldest frames; silence if it runs dry.
+    fn pop_into(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let cap = self.left.len();
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            if self.len == 0 {
+                (*a, *b) = (0.0, 0.0);
+                continue;
+            }
+            (*a, *b) = (self.left[self.read], self.right[self.read]);
+            self.read = (self.read + 1) % cap;
+            self.len -= 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Keeps the delay to at most `max` frames: monitoring must stay tight.
+    fn trim_to(&mut self, max: usize) {
+        while self.len > max {
+            self.read = (self.read + 1) % self.left.len();
+            self.len -= 1;
+        }
+    }
 }
 
 impl Engine {
@@ -138,6 +265,123 @@ impl Engine {
             order: (0..MAX_TRACKS).collect(),
             key_buffers: (0..MAX_TRACKS).map(|_| AudioBuffer::new(MIX_CHANNELS, info.max_frames)).collect(),
             is_key_source: [false; MAX_TRACKS],
+            input: None,
+            rec_track: None,
+            take: None,
+            next_take: 1,
+            latency_adjust: 0,
+            punch: None,
+            monitor: false,
+            monitor_fifo: MonitorFifo::new(8192),
+            monitor_l: vec![0.0; info.max_frames],
+            monitor_r: vec![0.0; info.max_frames],
+        }
+    }
+
+    /// Connects an input device. `samples` must hold whole frames (its
+    /// capacity a multiple of `channels`), so a frame never straddles the
+    /// ring's wrap-around point.
+    pub fn set_input(&mut self, samples: Consumer<f32>, channels: usize, recorder: Producer<RecEvent>, shared: Arc<RecordShared>) {
+        self.input = Some(Input { samples, channels: channels.max(1), recorder, shared, left: [0.0; CHUNK], right: [0.0; CHUNK], len: 0 });
+    }
+
+    fn end_take(&mut self) {
+        if let (Some(take), Some(input)) = (self.take.take(), self.input.as_mut()) {
+            input.flush();
+            input.send(RecEvent::End { take: take.id });
+            input.shared.recording.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Reads everything the input callback has delivered. Runs at the start
+    /// of every callback, recording or not: draining the ring is what keeps
+    /// input latency from building up.
+    ///
+    /// Each input frame gets a timeline position: the latency-compensated
+    /// one, meaning what the player was hearing when they played it. A take
+    /// includes exactly the frames whose position is inside the punch range
+    /// (or all of them, without one), so it starts and ends on the exact
+    /// frame, even when a callback straddles the punch point.
+    fn capture_input(&mut self, frames: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(input) = self.input.as_ref() else { return };
+        let channels = input.channels;
+        let waiting = input.samples.slots() / channels;
+        let (in_lat, out_lat) = (input.shared.input_latency.load(Relaxed), input.shared.output_latency.load(Relaxed));
+        let position = self.transport.position;
+        let spb = self.transport.context().samples_per_beat();
+        let punch = self.punch.map(|(a, b)| ((a * spb).round() as i64, (b * spb).round() as i64));
+        let active = self.transport.playing && self.rec_track.is_some();
+
+        // A jump (loop wrap, seek), a stop, or a change of armed track ends
+        // the take in progress.
+        let continuous = self.take.is_some_and(|t| t.expected == position && Some(t.track) == self.rec_track);
+        if self.take.is_some() && (!active || !continuous) {
+            self.end_take();
+        }
+        // Inside a take, positions continue by counting frames, so the take
+        // has no gaps or overlaps. A new one starts from the latency math.
+        let mut next_pos = match self.take {
+            Some(t) => t.next_pos,
+            None => take_start(position, waiting, in_lat, out_lat, self.latency_adjust),
+        };
+        let monitoring = self.monitor && self.rec_track.is_some();
+
+        // Borrow the fields separately: the chunk being read borrows the
+        // input ring while samples go elsewhere.
+        let Input { samples, recorder, shared, left, right, len, .. } = self.input.as_mut().unwrap();
+        let Ok(chunk) = samples.read_chunk(waiting * channels) else { return };
+        let (a, b) = chunk.as_slices();
+        let mut peak = 0.0f32;
+        for frame in a.chunks_exact(channels).chain(b.chunks_exact(channels)) {
+            // Mono inputs feed both sides; extra channels are ignored.
+            let (l, r) = (frame[0], frame[1.min(channels - 1)]);
+            peak = peak.max(l.abs()).max(r.abs());
+            if monitoring {
+                self.monitor_fifo.push(l, r);
+            }
+            let pos = next_pos;
+            next_pos += 1;
+            let wanted = active && punch.map_or(true, |(start, end)| pos >= start && pos < end);
+            match (wanted, self.take.is_some()) {
+                (true, false) => {
+                    // Punch in (or simply start), on this exact frame.
+                    let (id, track) = (self.next_take, self.rec_track.unwrap());
+                    self.next_take += 1;
+                    if recorder.push(RecEvent::Begin { take: id, track, start_frame: pos }).is_err() {
+                        shared.dropped.fetch_add(1, Relaxed);
+                    }
+                    shared.recording.store(true, Relaxed);
+                    self.take = Some(TakeState { id, track, expected: 0, next_pos: pos });
+                }
+                (false, true) => {
+                    // Punch out, on this exact frame.
+                    let id = self.take.take().unwrap().id;
+                    flush_chunk(recorder, shared, left, right, len);
+                    if recorder.push(RecEvent::End { take: id }).is_err() {
+                        shared.dropped.fetch_add(1, Relaxed);
+                    }
+                    shared.recording.store(false, Relaxed);
+                }
+                _ => {}
+            }
+            if wanted {
+                left[*len] = l;
+                right[*len] = r;
+                *len += 1;
+                if *len == CHUNK {
+                    flush_chunk(recorder, shared, left, right, len);
+                }
+            }
+        }
+        chunk.commit_all();
+        shared.record_peak(peak);
+        // For clock-drift measurement: frames received vs frames rendered.
+        shared.frames_in.fetch_add(waiting as u64, Relaxed);
+        shared.frames_out.fetch_add(frames as u64, Relaxed);
+        if let Some(t) = self.take.as_mut() {
+            t.expected = position + frames as u64;
+            t.next_pos = next_pos;
         }
     }
 
@@ -195,6 +439,10 @@ impl Engine {
                     }
                 }
                 Command::RemoveTrack { index } => {
+                    if self.rec_track == Some(index) {
+                        self.end_take();
+                        self.rec_track = None;
+                    }
                     // Forget any sidechain to or from the removed track.
                     if self.keys[index].is_some() || self.is_key_source[index] {
                         self.keys[index] = None;
@@ -253,6 +501,13 @@ impl Engine {
                     if let Some(inst) = self.track_mut(track).and_then(|t| t.instrument_mut()) {
                         inst.set_param(param, value);
                     }
+                }
+                Command::SetRecordTrack { track } => self.rec_track = track,
+                Command::SetLatencyAdjust { frames } => self.latency_adjust = frames,
+                Command::SetPunch { range } => self.punch = range,
+                Command::SetMonitor { on } => {
+                    self.monitor = on;
+                    self.monitor_fifo.clear();
                 }
                 Command::SetSidechain { track, source } => {
                     if track < MAX_TRACKS && source.map_or(true, |s| s < MAX_TRACKS && s != track) {
@@ -392,6 +647,10 @@ impl Engine {
 
         let dev_ch = self.device_channels;
         self.collect_live_midi(out.len() / dev_ch);
+        self.capture_input(out.len() / dev_ch);
+        // At most two callbacks' worth waiting: bursts are absorbed, but
+        // the monitoring delay can't creep up.
+        self.monitor_fifo.trim_to(2 * (out.len() / dev_ch));
         let mut block_start = 0; // frame of this block within the callback
         // Solo state can only change between callbacks, so check it once.
         let any_solo = self.tracks.iter().flatten().any(|t| t.solo);
@@ -437,7 +696,14 @@ impl Engine {
                         } else {
                             &[][..]
                         };
-                        let peaks = track.render_into(offset, n, &ctx, any_solo, master_bus, aux_bus, live, window, key);
+                        // The armed track hears the live input, if monitoring.
+                        let monitor = if self.monitor && self.rec_track == Some(i) {
+                            self.monitor_fifo.pop_into(&mut self.monitor_l[..n], &mut self.monitor_r[..n]);
+                            Some((&self.monitor_l[..n], &self.monitor_r[..n]))
+                        } else {
+                            None
+                        };
+                        let peaks = track.render_into(offset, n, &ctx, any_solo, master_bus, aux_bus, live, window, key, monitor);
                         self.meters.record(Target::Track(i), MeterPoint::PreFader, peaks.pre);
                         self.meters.record(Target::Track(i), MeterPoint::PostFader, peaks.post);
                         // If anyone listens to this track, keep a copy of
@@ -1000,5 +1266,217 @@ mod tests {
         h.send(Command::Seek { beat: 8.0 });
         let out = h.settle(2); // stopped the whole time
         assert!((db(out[0]) - db(0.5) - -20.0).abs() < 0.1, "the value at the playhead, without playing");
+    }
+
+    // ---- Step 10: recording ----
+
+    struct Rec {
+        input: Producer<f32>,
+        events: Consumer<RecEvent>,
+        shared: Arc<RecordShared>,
+        channels: usize,
+        next_sample: u32,
+    }
+
+    impl Rec {
+        fn wire(h: &mut Harness, channels: usize) -> Self {
+            let (input, samples) = RingBuffer::<f32>::new(8192 * channels);
+            let (recorder, events) = RingBuffer::<RecEvent>::new(1024);
+            let shared = RecordShared::new();
+            h.engine.set_input(samples, channels, recorder, shared.clone());
+            Self { input, events, shared, channels, next_sample: 1 }
+        }
+
+        /// What an input callback does: push `frames` frames. Each frame's
+        /// value is its own sequence number, so gaps and repeats show up.
+        fn feed(&mut self, frames: usize) {
+            for _ in 0..frames {
+                let v = self.next_sample as f32;
+                for ch in 0..self.channels {
+                    let _ = self.input.push(if ch == 0 { v } else { -v });
+                }
+                self.next_sample += 1;
+            }
+        }
+
+        fn drain(&mut self) -> (Vec<RecEvent>, Vec<f32>, Vec<f32>) {
+            let (mut ctrl, mut l, mut r) = (Vec::new(), Vec::new(), Vec::new());
+            while let Ok(ev) = self.events.pop() {
+                match ev {
+                    RecEvent::Samples { len, left, right } => {
+                        l.extend_from_slice(&left[..len]);
+                        r.extend_from_slice(&right[..len]);
+                    }
+                    other => ctrl.push(other),
+                }
+            }
+            (ctrl, l, r)
+        }
+    }
+
+    fn begin_frame(ev: &RecEvent) -> Option<(u32, i64)> {
+        match *ev {
+            RecEvent::Begin { take, start_frame, .. } => Some((take, start_frame)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_take_starts_compensated_and_records_every_frame() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        rec.shared.input_latency.store(100, std::sync::atomic::Ordering::Relaxed);
+        rec.shared.output_latency.store(400, std::sync::atomic::Ordering::Relaxed);
+        h.send(Command::SetLatencyAdjust { frames: 20 });
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::Seek { beat: 1.0 }); // 24_000
+        h.send(Command::Play);
+
+        let mut out = vec![0f32; 512 * 2];
+        rec.feed(300); // already waiting when the first callback runs
+        for _ in 0..20 {
+            h.engine.render(&mut out);
+            rec.feed(512);
+        }
+        h.send(Command::Stop);
+        h.engine.render(&mut out);
+
+        let (ctrl, left, right) = rec.drain();
+        assert_eq!(begin_frame(&ctrl[0]), Some((1, 24_000 - 300 - 100 - 400 - 20)), "every delay subtracted");
+        assert!(matches!(ctrl.last(), Some(RecEvent::End { take: 1 })));
+        // Every frame, in order, no gaps: 1, 2, 3...
+        let expected: Vec<f32> = (1..=left.len() as u32).map(|i| i as f32).collect();
+        assert_eq!(left, expected);
+        assert!(right.iter().zip(&left).all(|(r, l)| *r == -*l), "stereo kept apart");
+        assert_eq!(left.len(), 300 + 19 * 512, "everything delivered before the stop");
+    }
+
+    #[test]
+    fn loop_recording_makes_one_take_per_lap() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::SetLoop { range: Some((0.0, 1.0)) }); // 24_000 frames
+        h.send(Command::Play);
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..120 {
+            rec.feed(512);
+            h.engine.render(&mut out); // 120 x 512 = 2.56 laps
+        }
+        let (ctrl, ..) = rec.drain();
+        let begins: Vec<(u32, i64)> = ctrl.iter().filter_map(begin_frame).collect();
+        assert_eq!(begins.len(), 3, "{begins:?}");
+        // Laps 2 and 3 begin near the loop start (minus the frames waiting).
+        assert!(begins[1].1 <= 0 && begins[1].1 > -1024 && begins[2].1 <= 0 && begins[2].1 > -1024, "{begins:?}");
+        let ends = ctrl.iter().filter(|e| matches!(e, RecEvent::End { .. })).count();
+        assert_eq!(ends, 2, "the first two laps are finished");
+    }
+
+    #[test]
+    fn mono_input_records_to_both_sides() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 1);
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::Play);
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..4 {
+            rec.feed(512);
+            h.engine.render(&mut out);
+        }
+        let (_, left, right) = rec.drain();
+        assert!(!left.is_empty());
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn input_is_drained_even_when_not_recording() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..50 {
+            rec.feed(512);
+            h.engine.render(&mut out);
+        }
+        assert!(rec.input.slots() > 8192 * 2 - 2 * 512, "the ring never fills up");
+        assert!(rec.drain().0.is_empty(), "nothing recorded");
+        assert!(rec.shared.take_input_peak() > 0.0, "but the input meter still works");
+    }
+
+    // ---- Step 10 exercises ----
+
+    #[test]
+    fn punch_records_exactly_the_punch_range() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::SetPunch { range: Some((1.0, 2.0)) }); // frames 24_000..48_000
+        h.send(Command::Play);
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..120 {
+            rec.feed(512);
+            h.engine.render(&mut out);
+        }
+        let (ctrl, left, _) = rec.drain();
+        let begins: Vec<(u32, i64)> = ctrl.iter().filter_map(begin_frame).collect();
+        assert_eq!(begins, vec![(1, 24_000)], "punched in on the exact frame");
+        assert!(matches!(ctrl.last(), Some(RecEvent::End { take: 1 })), "and out again");
+        assert_eq!(left.len(), 24_000, "exactly one beat of audio");
+        // Each frame is fed 512 frames before the playhead reaches it, so
+        // the frame at timeline position p carries sequence number p + 513.
+        assert_eq!(left[0], 24_000.0 + 513.0, "the first frame is the one AT the punch point");
+        assert_eq!(*left.last().unwrap(), 47_999.0 + 513.0);
+    }
+
+    #[test]
+    fn monitoring_plays_the_input_through_the_tracks_effects() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        let mut gain: Box<dyn Processor> = Box::new(crate::nodes::Gain::new());
+        gain.prepare(&INFO);
+        gain.set_param(0, -6.0206); // halve it
+        h.send(Command::Insert { target: Target::Track(0), slot: 0, node: gain });
+        h.send(Command::SetRecordTrack { track: Some(0) });
+
+        let mut out = vec![0f32; 512 * 2];
+        let mut run = |h: &mut Harness| {
+            for _ in 0..30 {
+                for _ in 0..512 {
+                    let _ = rec.input.push(0.5);
+                    let _ = rec.input.push(0.5);
+                }
+                h.engine.render(&mut out);
+            }
+            out[100]
+        };
+        assert_eq!(run(&mut h), 0.0, "off by default (it can feed back through speakers)");
+        h.send(Command::SetMonitor { on: true });
+        assert!((run(&mut h) - 0.25).abs() < 1e-4, "on: heard through the track's gain effect, while stopped");
+        h.send(Command::SetRecordTrack { track: None });
+        assert_eq!(run(&mut h), 0.0, "only the armed track monitors");
+    }
+
+    #[test]
+    fn a_fast_input_clock_shows_up_as_drift() {
+        use crate::record::DriftEstimator;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        let mut out = vec![0f32; 512 * 2];
+        let mut est = DriftEstimator::default();
+        // The input delivers 513 frames for every 512 rendered: 1953 ppm.
+        for _ in 0..2_000 {
+            rec.feed(513);
+            h.engine.render(&mut out);
+            est.add(rec.shared.frames_in.load(Relaxed), rec.shared.frames_out.load(Relaxed));
+        }
+        let ppm = est.ppm(48_000.0).unwrap();
+        assert!((ppm - 1_000_000.0 / 512.0).abs() < 1.0, "{ppm:.1} ppm");
     }
 }

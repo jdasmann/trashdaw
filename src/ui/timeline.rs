@@ -298,6 +298,12 @@ impl DawApp {
             let r = Rect::from_x_y_ranges(view.beat_to_x(a).max(view.origin)..=view.beat_to_x(b), ruler.y_range());
             painter.rect_filled(r, Rounding::ZERO, Color32::from_rgba_unmultiplied(220, 170, 60, 70));
         }
+        // The punch range, in red, along the bottom half of the ruler.
+        if let Some((a, b)) = self.session.punch {
+            let y = ruler.center().y..=ruler.bottom();
+            let r = Rect::from_x_y_ranges(view.beat_to_x(a).max(view.origin)..=view.beat_to_x(b), y);
+            painter.rect_filled(r, Rounding::ZERO, Color32::from_rgba_unmultiplied(220, 60, 50, 110));
+        }
         let first_bar = (view.x_to_beat(view.origin) / BEATS_PER_BAR).floor().max(0.0) as i64;
         let last_bar = (view.x_to_beat(area.right()) / BEATS_PER_BAR).ceil() as i64;
         // Thin out bar labels when zoomed out.

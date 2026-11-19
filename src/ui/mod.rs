@@ -45,6 +45,8 @@ pub struct DawApp {
     loop_bars: (f64, f64),
     /// The open piano roll, if any.
     piano: Option<pianoroll::PianoRoll>,
+    input_meter: meter::MeterState,
+    punch_bars: (f64, f64),
 }
 
 impl DawApp {
@@ -61,6 +63,8 @@ impl DawApp {
             midi_ports: Vec::new(),
             loop_bars: (1.0, 5.0),
             piano: None,
+            input_meter: meter::MeterState::default(),
+            punch_bars: (3.0, 5.0),
         }
     }
 
@@ -79,7 +83,7 @@ impl DawApp {
     /// it with a bare `egui::Context`, no window needed.
     pub fn ui(&mut self, ctx: &egui::Context) {
         self.session.collect_garbage();
-        for msg in self.session.take_messages() {
+        for msg in self.session.take_messages().into_iter().chain(self.session.poll_recordings()) {
             self.status = msg.clone();
             self.log.push(msg);
         }
@@ -132,6 +136,13 @@ impl DawApp {
                 self.report(r);
             }
             ui.monospace(format!("{}   {:7.2}s", format_bbt(self.session.current_beat()), self.session.position_secs()));
+            if let Some(r) = self.session.recorder() {
+                if r.shared.recording.load(std::sync::atomic::Ordering::Relaxed) {
+                    ui.label(egui::RichText::new("● REC").strong().color(egui::Color32::from_rgb(230, 60, 50)));
+                } else if let Some(t) = self.session.rec_track {
+                    ui.label(egui::RichText::new(format!("armed: track {t}")).color(egui::Color32::from_rgb(200, 120, 110)));
+                }
+            }
             ui.separator();
 
             let mut tempo = self.session.tempo();
@@ -152,6 +163,18 @@ impl DawApp {
                 self.report(r);
             }
             ui.checkbox(&mut self.session.return_to_start, "return on stop");
+            if self.session.recorder().is_some() {
+                let mut punching = self.session.punch.is_some();
+                let mut changed = ui.checkbox(&mut punching, "punch").on_hover_text("record only inside this range of bars").changed();
+                changed |= ui.add(egui::DragValue::new(&mut self.punch_bars.0).speed(0.1).clamp_range(1.0..=999.0)).changed();
+                ui.label("to");
+                changed |= ui.add(egui::DragValue::new(&mut self.punch_bars.1).speed(0.1).clamp_range(1.0..=1000.0)).changed();
+                if changed {
+                    let range = punching.then(|| (session::bar_to_beat(self.punch_bars.0), session::bar_to_beat(self.punch_bars.1)));
+                    let r = self.session.set_punch(range);
+                    self.report(r);
+                }
+            }
             ui.separator();
 
             ui.checkbox(&mut self.timeline.snapping, "snap");
@@ -203,6 +226,9 @@ impl DawApp {
         }
 
         ui.separator();
+        self.input_ui(ui);
+
+        ui.separator();
         ui.strong("MIDI input");
         ui.horizontal(|ui| {
             if ui.button("Find ports").clicked() {
@@ -233,6 +259,74 @@ impl DawApp {
             for line in self.log.iter().rev().take(8) {
                 ui.small(line);
             }
+        }
+    }
+}
+
+impl DawApp {
+    /// The audio input: level, latency, and the manual adjustment.
+    fn input_ui(&mut self, ui: &mut egui::Ui) {
+        use std::sync::atomic::Ordering::Relaxed;
+        ui.strong("Audio input");
+        let Some(r) = self.session.recorder() else {
+            ui.weak("No input device: recording is unavailable.");
+            return;
+        };
+        ui.small(&r.device);
+        let (peak, out_lat, in_lat, dropped) = (
+            r.shared.take_input_peak(),
+            r.shared.output_latency.load(Relaxed),
+            r.shared.input_latency.load(Relaxed),
+            r.shared.dropped.load(Relaxed),
+        );
+        let dt = ui.input(|i| i.unstable_dt).clamp(0.0, 0.25);
+        self.input_meter.update(peak, dt);
+
+        // A horizontal level meter, so you can set the input gain.
+        let (resp, painter) = ui.allocate_painter(egui::Vec2::new(ui.available_width().min(180.0), 8.0), egui::Sense::click());
+        let rect = resp.rect;
+        painter.rect_filled(rect, egui::Rounding::same(2.0), egui::Color32::from_gray(20));
+        let m = self.input_meter;
+        let w = meter::MeterState::fraction(m.db) * rect.width();
+        let color = if m.clipped { egui::Color32::from_rgb(220, 60, 50) } else { egui::Color32::from_rgb(80, 200, 100) };
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::Vec2::new(w, rect.height())), egui::Rounding::ZERO, color);
+        if resp.clicked() {
+            self.input_meter.clipped = false;
+        }
+
+        let ms = |frames: u32| frames as f64 * 1000.0 / self.session.sample_rate;
+        ui.small(format!("latency: out {:.1} ms + in {:.1} ms", ms(out_lat), ms(in_lat)))
+            .on_hover_text("as reported by the driver; takes are moved earlier by this much");
+        let mut adjust = self.session.latency_adjust_ms;
+        let drag = egui::DragValue::new(&mut adjust).speed(0.1).clamp_range(-500.0..=500.0).suffix(" ms");
+        let changed = ui
+            .horizontal(|ui| {
+                ui.small("adjust");
+                ui.add(drag).on_hover_text("extra compensation: calibrate with a loopback cable if takes land late or early").changed()
+            })
+            .inner;
+        if changed {
+            let r = self.session.set_latency_adjust(adjust);
+            self.report(r);
+        }
+        let mut monitor = self.session.monitor;
+        let tip = "hear the input through the armed track and its effects. Use headphones: with speakers and a microphone, it can feed back";
+        if ui.checkbox(&mut monitor, "monitor input").on_hover_text(tip).changed() {
+            let r = self.session.set_monitor(monitor);
+            self.report(r);
+        }
+        ui.horizontal(|ui| {
+            match self.session.drift_ppm() {
+                Some(ppm) => ui.small(format!("clock drift: {ppm:+.1} ppm ({:.0} s)", self.session.drift.span_frames() / self.session.sample_rate)),
+                None => ui.small("clock drift: measuring..."),
+            }
+            .on_hover_text("how much faster the input's clock runs than the output's; nonzero means takes slowly slide in time");
+            if ui.small_button("reset").clicked() {
+                self.session.drift.reset();
+            }
+        });
+        if dropped > 0 {
+            ui.colored_label(egui::Color32::from_rgb(230, 120, 60), format!("{dropped} chunks dropped: the disk couldn't keep up"));
         }
     }
 }
@@ -524,5 +618,62 @@ mod tests {
         h.drag(at, to);
         let n = h.app.session.project.tracks[1].as_ref().unwrap().midi_clips[0].notes.clone();
         assert_eq!((n[0].start, n[0].pitch), (3.0, 77));
+    }
+
+    // ---- Step 10: recording ----
+
+    #[test]
+    fn recording_controls_render_and_finished_takes_land() {
+        use crate::record::{Finished, RecordShared};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Arc;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = RecordShared::new();
+        let for_session = shared.clone();
+        let mut h = Harness::new(move |t| {
+            project(t);
+            t.session.attach_recorder(session::Recorder { device: "Mic".into(), done: rx, shared: for_session });
+        });
+        h.app.session.set_record_track(Some(0)).unwrap();
+        shared.recording.store(true, Relaxed);
+        shared.record_peak(0.5);
+        shared.output_latency.store(480, Relaxed);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        assert!(h.app.input_meter.db > -7.0, "the input meter shows the level");
+
+        let audio = Arc::new(crate::loader::AudioData { name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; 48_000]; 2] });
+        tx.send(Finished { take: 1, track: 0, start_frame: 192_000, path: Ok("recordings/take-001.wav".into()), audio }).unwrap();
+        h.frame(vec![]);
+        assert!(h.app.status.starts_with("recorded take 1"), "{}", h.app.status);
+        assert_eq!(h.app.session.project.tracks[0].as_ref().unwrap().clips.len(), 2);
+        h.frame(vec![]); // and the new clip draws
+        assert_eq!(h.app.timeline.clip_rects.len(), 3);
+    }
+
+    #[test]
+    fn punch_monitor_and_drift_controls_render() {
+        use crate::record::RecordShared;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let shared = RecordShared::new();
+        let for_session = shared.clone();
+        let mut h = Harness::new(move |t| {
+            project(t);
+            t.session.attach_recorder(session::Recorder { device: "Mic".into(), done: rx, shared: for_session });
+        });
+        h.app.session.set_record_track(Some(0)).unwrap();
+        h.app.session.set_monitor(true).unwrap();
+        h.app.session.set_punch(Some((8.0, 16.0))).unwrap();
+        // Two seconds' worth of counters per frame, input 100 ppm fast.
+        for k in 1..=10u64 {
+            let out = k * 96_000;
+            shared.frames_out.store(out, Relaxed);
+            shared.frames_in.store(out + out / 10_000, Relaxed);
+            h.frame(vec![]);
+        }
+        let ppm = h.app.session.drift_ppm().expect("enough history");
+        assert!((ppm - 100.0).abs() < 1.0, "{ppm}");
     }
 }

@@ -43,6 +43,9 @@ pub fn print_help() {
     println!("           note add <t> <clip> <beat> <length> <pitch> [velocity] | note clear <t> <clip>");
     println!("           midi ports | midi open <port#> | midi close | arm <t> | arm off");
     println!("           (pitches: 60 or C4, F#3, Bb2; note beats are relative to the clip)");
+    println!("Record:    rec <t> | rec off | input | latency <ms> | monitor <on|off>");
+    println!("           punch <start_bar> <end_bar> | punch off   (record only inside the range)");
+    println!("           (armed tracks record while playing; with a loop, each lap is a new take)");
     println!("Transport: play | stop | seek <bar> | tempo <bpm> | loop <start_bar> <end_bar> | loop off | pos");
     println!("           return <on|off> | help | q");
     println!("(<t> is a track number, a is the aux bus, m is the master bus)");
@@ -53,6 +56,9 @@ pub fn run(session: &mut Session) -> io::Result<()> {
     print_help();
     for line in io::stdin().lock().lines() {
         session.collect_garbage();
+        for msg in session.poll_recordings() {
+            println!("{msg}");
+        }
         let line = line?;
         if line.trim() == "q" {
             break;
@@ -233,6 +239,50 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
         ["arm", "off"] => s.arm(None)?,
         ["arm", t] => s.arm(Some(track_arg(s, t)?))?,
 
+        // ---- Recording ----
+        ["rec", "off"] => s.set_record_track(None)?,
+        ["rec", t] => {
+            let track = track_arg(s, t)?;
+            s.set_record_track(Some(track))?;
+            println!("track {track} armed: it records whenever you play");
+        }
+        ["latency", ms] => s.set_latency_adjust(num(ms, "milliseconds")?)?,
+        ["monitor", "on"] => s.set_monitor(true)?,
+        ["monitor", "off"] => s.set_monitor(false)?,
+        ["punch", "off"] => s.set_punch(None)?,
+        ["punch", a, b] => {
+            let (a, b): (f64, f64) = (num(a, "bar")?, num(b, "bar")?);
+            if a < 1.0 {
+                return Err("bars start at 1".into());
+            }
+            s.set_punch(Some((bar_to_beat(a), bar_to_beat(b))))?;
+        }
+        ["input"] => match s.recorder() {
+            None => println!("  no input device: recording is unavailable"),
+            Some(r) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let ms = |frames: u32| frames as f64 * 1000.0 / s.sample_rate;
+                let peak = r.shared.take_input_peak();
+                println!("  device: {}", r.device);
+                println!("  level since last check: {}", peak_db(peak).trim());
+                println!(
+                    "  latency: output {:.1} ms + input {:.1} ms (driver) + {:.1} ms (manual)",
+                    ms(r.shared.output_latency.load(Relaxed)),
+                    ms(r.shared.input_latency.load(Relaxed)),
+                    s.latency_adjust_ms
+                );
+                println!("  armed: {}   monitoring: {}", s.rec_track.map_or("none".into(), |t| format!("track {t}")), if s.monitor { "on" } else { "off" });
+                match s.drift_ppm() {
+                    Some(ppm) => println!("  clock drift: {ppm:+.1} ppm over {:.0} s", s.drift.span_frames() / s.sample_rate),
+                    None => println!("  clock drift: measuring (needs ~10 s of running time)"),
+                }
+                let dropped = r.shared.dropped.load(Relaxed);
+                if dropped > 0 {
+                    println!("  WARNING: {dropped} chunks dropped (the disk couldn't keep up)");
+                }
+            }
+        },
+
         // ---- Transport ----
         ["play"] => s.play()?,
         ["stop"] => s.stop()?,
@@ -271,6 +321,9 @@ fn list(s: &Session) {
     for target in targets {
         let Some(t) = s.project.get(target) else { continue };
         let mut flags = String::new();
+        if target == Target::Track(s.rec_track.unwrap_or(usize::MAX)) {
+            flags.push_str(" REC");
+        }
         if t.mute {
             flags.push_str(" MUTE");
         }

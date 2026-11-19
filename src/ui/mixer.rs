@@ -101,6 +101,14 @@ impl DawApp {
                 let r = self.session.set_solo(track, !solo);
                 self.report(r);
             }
+            if self.session.recorder().is_some() {
+                let armed = self.session.rec_track == Some(track);
+                let dot = egui::RichText::new("●").color(if armed { Color32::from_rgb(230, 60, 50) } else { Color32::GRAY });
+                if ui.selectable_label(armed, dot).on_hover_text("arm for recording: records whenever you play").clicked() {
+                    let r = self.session.set_record_track(if armed { None } else { Some(track) });
+                    self.report(r);
+                }
+            }
             if has_instrument {
                 let armed = self.session.armed == Some(track);
                 if ui.selectable_label(armed, "R").on_hover_text("arm for live MIDI input").clicked() {

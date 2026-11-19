@@ -13,13 +13,14 @@ use crate::midi::{LiveMidi, MidiMessage, Note, Sequence};
 use crate::mixer::{Meters, Target, Track, MAX_SLOTS, MAX_TRACKS};
 use crate::nodes;
 use crate::processor::{Instrument, ParamInfo, PrepareInfo};
+use crate::record::{DriftEstimator, Finished, RecordShared};
 use crate::project::{AutoLaneInfo, ClipInfo, MidiClipInfo, NodeInfo, Project, TrackInfo};
 use crate::synth::Synth;
 use crate::transport::{samples_per_beat, TransportShared, BEATS_PER_BAR};
 use midir::{MidiInput, MidiInputConnection};
 use rtrb::{Consumer, Producer};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 pub type Result<T = ()> = std::result::Result<T, String>;
@@ -54,6 +55,23 @@ pub struct Session {
     // open; the lock is never taken on the audio thread.
     live_tx: Arc<Mutex<Producer<LiveMidi>>>,
     midi_conn: Option<MidiInputConnection<()>>,
+    // --- Recording ---
+    recorder: Option<Recorder>,
+    /// The track armed for recording.
+    pub rec_track: Option<usize>,
+    /// Manual latency adjustment in milliseconds (see `record::take_start`).
+    pub latency_adjust_ms: f64,
+    /// Record only inside this range (beats).
+    pub punch: Option<(f64, f64)>,
+    pub monitor: bool,
+    pub drift: DriftEstimator,
+}
+
+/// The main thread's end of recording, present when there's an input.
+pub struct Recorder {
+    pub device: String,
+    pub done: mpsc::Receiver<Finished>,
+    pub shared: Arc<RecordShared>,
 }
 
 impl Session {
@@ -82,7 +100,118 @@ impl Session {
             armed: None,
             live_tx: Arc::new(Mutex::new(live_tx)),
             midi_conn: None,
+            recorder: None,
+            rec_track: None,
+            latency_adjust_ms: 0.0,
+            punch: None,
+            monitor: false,
+            drift: DriftEstimator::default(),
         }
+    }
+
+    pub fn attach_recorder(&mut self, recorder: Recorder) {
+        self.recorder = Some(recorder);
+    }
+
+    pub fn recorder(&self) -> Option<&Recorder> {
+        self.recorder.as_ref()
+    }
+
+    /// Arms a track for recording (or disarms with `None`). Recording then
+    /// happens whenever the transport plays.
+    pub fn set_record_track(&mut self, track: Option<usize>) -> Result {
+        if self.recorder.is_none() && track.is_some() {
+            return Err("no input device: recording is unavailable".into());
+        }
+        if let Some(t) = track {
+            self.track_info(t)?;
+        }
+        self.send(Command::SetRecordTrack { track })?;
+        self.rec_track = track;
+        Ok(())
+    }
+
+    pub fn set_latency_adjust(&mut self, ms: f64) -> Result {
+        let ms = ms.clamp(-500.0, 500.0);
+        self.send(Command::SetLatencyAdjust { frames: (ms * self.sample_rate / 1000.0).round() as i64 })?;
+        self.latency_adjust_ms = ms;
+        Ok(())
+    }
+
+    /// Records only between `range.0` and `range.1` (beats) while armed
+    /// and playing, or everywhere with `None`.
+    pub fn set_punch(&mut self, range: Option<(f64, f64)>) -> Result {
+        if let Some((a, b)) = range {
+            if a < 0.0 || b <= a {
+                return Err("the punch range must end after it starts".into());
+            }
+        }
+        self.send(Command::SetPunch { range })?;
+        self.punch = range;
+        Ok(())
+    }
+
+    /// Hear the input through the armed track (and its effects). Off by
+    /// default: with a microphone and speakers, it can feed back.
+    pub fn set_monitor(&mut self, on: bool) -> Result {
+        if on && self.recorder.is_none() {
+            return Err("no input device to monitor".into());
+        }
+        self.send(Command::SetMonitor { on })?;
+        self.monitor = on;
+        Ok(())
+    }
+
+    /// Clock drift between input and output, in ppm, once there are at
+    /// least 10 seconds of history.
+    pub fn drift_ppm(&self) -> Option<f64> {
+        self.drift.ppm(self.sample_rate * 10.0)
+    }
+
+    /// Turns finished takes into clips, and samples the drift counters.
+    /// Call regularly, like `collect_garbage`. Returns a message per take.
+    pub fn poll_recordings(&mut self) -> Vec<String> {
+        let finished: Vec<Finished> = match &self.recorder {
+            Some(r) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                self.drift.add(r.shared.frames_in.load(Relaxed), r.shared.frames_out.load(Relaxed));
+                r.done.try_iter().collect()
+            }
+            None => return Vec::new(),
+        };
+        finished.into_iter().map(|f| self.place_take(f)).collect()
+    }
+
+    fn place_take(&mut self, f: Finished) -> String {
+        let secs = f.audio.duration_secs();
+        let saved = match &f.path {
+            Ok(p) => format!("saved as {}", p.display()),
+            Err(e) => format!("{e}; the take is kept in memory only"),
+        };
+        let index = {
+            let mut lib = self.library.lock().unwrap();
+            lib.push(f.audio.clone());
+            lib.len() - 1
+        };
+        if secs <= 0.0 || self.track_info(f.track).is_err() {
+            return format!("take {} ({secs:.1}s) is in the library as #{index} ({saved})", f.take);
+        }
+        // Latency compensation can put a take's start before the song's: it
+        // then starts at zero, with that much trimmed off the front.
+        let (start_frame, offset_secs) = if f.start_frame < 0 {
+            (0, -f.start_frame as f64 / f.audio.sample_rate)
+        } else {
+            (f.start_frame, 0.0)
+        };
+        let spb = samples_per_beat(self.sample_rate, self.tempo());
+        let id = self.new_clip_id();
+        let mut params = ClipParams::new(id, start_frame as f64 / spb, (secs - offset_secs).max(0.0) * self.tempo() / 60.0);
+        params.offset_secs = offset_secs;
+        self.project.tracks[f.track].as_mut().unwrap().clips.push(ClipInfo { data: f.audio, params });
+        if let Err(e) = self.sync_clips(f.track) {
+            return e;
+        }
+        format!("recorded take {} ({secs:.1}s) on track {} ({saved})", f.take, f.track)
     }
 
     fn send(&mut self, cmd: Command) -> Result {
@@ -217,6 +346,9 @@ impl Session {
         }
         if self.armed == Some(index) {
             self.armed = None;
+        }
+        if self.rec_track == Some(index) {
+            self.rec_track = None;
         }
         Ok(())
     }
@@ -990,5 +1122,133 @@ pub mod tests {
         t.session.add_automation(0, AutoTarget::Instrument { param: 6 }).unwrap();
         t.session.set_synth(0, false).unwrap();
         assert!(t.session.project.tracks[0].as_ref().unwrap().automation.is_empty());
+    }
+
+    // ---- Step 10: recording ----
+
+    fn with_recorder(t: &mut TestSession) -> mpsc::Sender<Finished> {
+        let (tx, rx) = mpsc::channel();
+        t.session.attach_recorder(Recorder { device: "test".into(), done: rx, shared: RecordShared::new() });
+        tx
+    }
+
+    fn finished(track: usize, start_frame: i64, seconds: f64) -> Finished {
+        let frames = (seconds * 48_000.0) as usize;
+        let audio = Arc::new(AudioData { name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; frames]; 2] });
+        Finished { take: 1, track, start_frame, path: Ok(PathBuf::from("recordings/take-001.wav")), audio }
+    }
+
+    #[test]
+    fn finished_takes_become_clips() {
+        let mut t = TestSession::new();
+        t.session.add_track(None).unwrap();
+        let tx = with_recorder(&mut t);
+        tx.send(finished(0, 96_000, 2.0)).unwrap(); // 2 s from beat 4
+        let msgs = t.session.poll_recordings();
+        assert!(msgs[0].starts_with("recorded take 1"), "{msgs:?}");
+        let clip = &t.session.project.tracks[0].as_ref().unwrap().clips[0];
+        assert_eq!((clip.params.start_beat, clip.params.length_beats, clip.params.offset_secs), (4.0, 4.0, 0.0));
+        assert_eq!(t.session.samples().len(), 1, "and it's in the library");
+    }
+
+    #[test]
+    fn a_take_starting_before_zero_is_trimmed() {
+        let mut t = TestSession::new();
+        t.session.add_track(None).unwrap();
+        let tx = with_recorder(&mut t);
+        tx.send(finished(0, -2_400, 2.0)).unwrap(); // 50 ms before the start
+        t.session.poll_recordings();
+        let p = t.session.project.tracks[0].as_ref().unwrap().clips[0].params;
+        assert_eq!(p.start_beat, 0.0);
+        assert!((p.offset_secs - 0.05).abs() < 1e-9, "the first 50 ms are skipped");
+        assert!((p.length_beats - 1.95 * 2.0).abs() < 1e-9, "and the clip is that much shorter");
+    }
+
+    #[test]
+    fn recording_needs_an_input() {
+        let mut t = TestSession::new();
+        t.session.add_track(None).unwrap();
+        assert!(t.session.set_record_track(Some(0)).is_err());
+        with_recorder(&mut t);
+        t.session.set_record_track(Some(0)).unwrap();
+        t.session.remove_track(0).unwrap();
+        assert_eq!(t.session.rec_track, None, "removing the track disarms it");
+    }
+
+    #[test]
+    fn recording_end_to_end() {
+        use crate::engine::Engine;
+        use crate::record::{spawn_writer, RecEvent};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // Session -> engine -> disk writer -> session, all real.
+        let TestSession { session: mut s, commands, garbage: _g, live: _l } = TestSession::new();
+        let (gtx, grx) = RingBuffer::<Garbage>::new(256);
+        let (_ltx, lrx) = RingBuffer::<LiveMidi>::new(16);
+        let mut engine = Engine::new(&INFO, 2, s.shared.clone(), s.meters.clone(), commands, gtx, lrx);
+        drop(grx);
+        let (mut input, samples) = RingBuffer::<f32>::new(48_000 * 2);
+        let (rec_tx, rec_rx) = RingBuffer::<RecEvent>::new(1024);
+        let shared = RecordShared::new();
+        shared.output_latency.store(480, Relaxed); // 10 ms
+        engine.set_input(samples, 2, rec_tx, shared.clone());
+        let dir = std::env::temp_dir().join("daw_e2e_recording");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = spawn_writer(rec_rx, dir.clone(), 48_000, done_tx);
+        s.attach_recorder(Recorder { device: "test".into(), done: done_rx, shared });
+
+        s.add_track(Some("Vocals".into())).unwrap();
+        s.set_record_track(Some(0)).unwrap();
+        s.seek(4.0).unwrap(); // bar 2
+        s.play().unwrap();
+
+        // One second: a 220 Hz tone arriving 512 frames per callback.
+        let mut out = vec![0f32; 512 * 2];
+        let mut n = 0u32;
+        for _ in 0..94 {
+            for _ in 0..512 {
+                let v = (n as f32 * 220.0 / 48_000.0 * std::f32::consts::TAU).sin() * 0.5;
+                let _ = input.push(v);
+                let _ = input.push(v);
+                n += 1;
+            }
+            engine.render(&mut out);
+        }
+        s.stop().unwrap();
+        engine.render(&mut out);
+
+        // Wait for the disk writer, then let the session place the take.
+        let mut msgs = Vec::new();
+        for _ in 0..500 {
+            msgs = s.poll_recordings();
+            if !msgs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(msgs[0].starts_with("recorded take 1"), "{msgs:?}");
+        let clip = &s.project.tracks[0].as_ref().unwrap().clips[0];
+        // Bar 2 = sample 96_000; the first input frames were already 512
+        // frames old, and output latency is 480: 992 frames = 0.0413 beats.
+        assert!((clip.params.start_beat - (96_000.0 - 992.0) / 24_000.0).abs() < 1e-9, "{}", clip.params.start_beat);
+        assert_eq!(clip.data.frames(), 94 * 512, "every frame recorded");
+        assert!((clip.data.channels[0][100] - (100.0f32 * 220.0 / 48_000.0 * std::f32::consts::TAU).sin() * 0.5).abs() < 1e-6);
+        let on_disk = crate::loader::load_audio(&dir.join("take-001.wav")).unwrap();
+        assert_eq!(on_disk.channels, clip.data.channels, "the WAV on disk is the take");
+
+        drop(engine);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn punch_and_monitor_settings() {
+        let mut t = TestSession::new();
+        assert!(t.session.set_monitor(true).is_err(), "nothing to monitor without an input");
+        with_recorder(&mut t);
+        t.session.set_monitor(true).unwrap();
+        assert!(t.session.set_punch(Some((8.0, 4.0))).is_err());
+        t.session.set_punch(Some((4.0, 8.0))).unwrap();
+        assert_eq!(t.session.punch, Some((4.0, 8.0)));
     }
 }
