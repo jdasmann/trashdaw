@@ -98,6 +98,7 @@ pub fn project(parts: Parts) -> Project {
         if t < 8 && parts.audio {
             let frames = 48_000 * 70;
             let data = Arc::new(AudioData {
+                path: None,
                 name: "noise".into(),
                 sample_rate: 44_100.0, // forces resampling, the realistic case
                 channels: vec![noise(frames, t as u32 + 1), noise(frames, t as u32 + 100)],
@@ -154,7 +155,7 @@ mod tests {
         use crate::buffer::AudioBuffer;
         use crate::transport::Transport;
         let frames = 48_000 * 30;
-        let data = Arc::new(AudioData { name: "n".into(), sample_rate: 44_100.0, channels: vec![noise(frames, 1), noise(frames, 2)] });
+        let data = Arc::new(AudioData { path: None, name: "n".into(), sample_rate: 44_100.0, channels: vec![noise(frames, 1), noise(frames, 2)] });
         let mut list = ClipList::new(vec![AudioClip::new(data, ClipParams::new(1, 0.0, 100.0), &INFO)]);
         let mut t = Transport::new(SR as f64);
         t.playing = true;

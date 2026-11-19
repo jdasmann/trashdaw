@@ -1,0 +1,12 @@
+[package]
+name = "clap-example"
+version = "0.1.0"
+edition = "2021"
+description = "Example Gain and Example Beep: tiny CLAP plugins for testing the DAW's host"
+
+[lib]
+# A C-compatible shared library: what a .clap file is.
+crate-type = ["cdylib"]
+
+[dependencies]
+clap-sys = "0.5"

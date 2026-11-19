@@ -294,7 +294,7 @@ impl DawApp {
     fn ruler_ui(&mut self, ui: &mut Ui, painter: &egui::Painter, view: &View, area: Rect, snapping: bool) {
         let ruler = Rect::from_min_max(Pos2::new(view.origin, area.top()), Pos2::new(area.right(), area.top() + RULER_H));
         painter.rect_filled(ruler, Rounding::ZERO, Color32::from_gray(40));
-        if let Some((a, b)) = self.session.loop_range {
+        if let Some((a, b)) = self.session.project.loop_range {
             let r = Rect::from_x_y_ranges(view.beat_to_x(a).max(view.origin)..=view.beat_to_x(b), ruler.y_range());
             painter.rect_filled(r, Rounding::ZERO, Color32::from_rgba_unmultiplied(220, 170, 60, 70));
         }
@@ -693,7 +693,7 @@ mod tests {
         let mut ch = vec![0.0f32; 1000];
         ch[10] = 0.9;
         ch[300] = -0.7;
-        let data = AudioData { name: "x".into(), sample_rate: 48_000.0, channels: vec![ch] };
+        let data = AudioData { path: None, name: "x".into(), sample_rate: 48_000.0, channels: vec![ch] };
         let o = overview(&data);
         assert_eq!(o.len(), 4); // 1000 / 256, rounded up
         assert_eq!(o[0], (0.0, 0.9));

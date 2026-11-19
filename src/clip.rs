@@ -12,7 +12,7 @@ const FADE_SECS: f64 = 0.003;
 
 /// Everything about a clip that the user edits. Plain `Copy` data, shared
 /// by the main thread's project model and the engine's `AudioClip`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipParams {
     /// Stable id, so a clip can be found again after edits.
     pub id: u32,
@@ -457,7 +457,7 @@ mod tests {
     const INFO: PrepareInfo = PrepareInfo { sample_rate: SR, max_frames: 4096, channels: 2 };
 
     fn audio(channels: Vec<Vec<f32>>) -> Arc<AudioData> {
-        Arc::new(AudioData { name: "test".into(), sample_rate: SR as f64, channels })
+        Arc::new(AudioData { path: None, name: "test".into(), sample_rate: SR as f64, channels })
     }
 
     fn dc(value: f32) -> Arc<AudioData> {
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn steady_fast_path_matches_the_general_path_exactly() {
-        let file = |sr: f64| Arc::new(AudioData { name: "r".into(), sample_rate: sr, channels: vec![ramp(200_000), ramp(200_000)] });
+        let file = |sr: f64| Arc::new(AudioData { path: None, name: "r".into(), sample_rate: sr, channels: vec![ramp(200_000), ramp(200_000)] });
         let mut faded = ClipParams::new(1, 0.5, 5.0);
         faded.fade_in_beats = 0.5;
         faded.fade_out_beats = 1.0;

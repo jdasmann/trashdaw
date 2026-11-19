@@ -7,6 +7,7 @@ use crate::project::{ClipInfo, Project};
 use crate::session::{bar_to_beat, clean_path, demo_notes, Result, Session};
 use crate::transport::{format_bbt, BEATS_PER_BAR};
 use std::io::{self, BufRead};
+use std::path::PathBuf;
 
 fn target_label(project: &Project, target: Target) -> String {
     match target {
@@ -26,6 +27,7 @@ fn peak_db(peak: f32) -> String {
 }
 
 pub fn print_help() {
+    println!("Project:   save [path] | open <path> | new | undo | redo | history");
     println!("Tracks:    track add [name] | track rm <t> | ls");
     println!("Mixer:     vol <t|a|m> <db> | pan <t> <-1..1> | mute <t> | solo <t> | send <t> <db> | meters");
     println!("           sidechain <t> <source t> | sidechain <t> off   (a comp on <t> then listens to the source)");
@@ -33,6 +35,7 @@ pub fn print_help() {
     let kinds: Vec<&str> = crate::nodes::KINDS.iter().map(|k| k.0).collect();
     println!("           kinds: {}", kinds.join(" "));
     println!("           filter types: 0 lowpass 1 highpass 2 bandpass 3 notch 4 peak 5 low-shelf 6 high-shelf");
+    println!("Plugins:   plugins scan | plugins | plugin <t|a|m> <n> | instrument <t> <n>   (CLAP; n from `plugins`)");
     println!("Samples:   load <path> | samples");
     println!("Clips:     clip add <t> <sample#> <bar> | clip rm <t> <id>");
     println!("           clip mv <t> <id> <bar> | clip len <t> <id> <beats> | clip off <t> <id> <secs>");
@@ -54,6 +57,7 @@ pub fn print_help() {
 /// Runs the command loop until `q` or end of input.
 pub fn run(session: &mut Session) -> io::Result<()> {
     print_help();
+    let mut quit_warned = false;
     for line in io::stdin().lock().lines() {
         session.collect_garbage();
         for msg in session.poll_recordings() {
@@ -61,8 +65,14 @@ pub fn run(session: &mut Session) -> io::Result<()> {
         }
         let line = line?;
         if line.trim() == "q" {
+            if session.history.unsaved() && !quit_warned {
+                println!("unsaved changes: `save <path>` first, or type q again to quit without saving");
+                quit_warned = true;
+                continue;
+            }
             break;
         }
+        quit_warned = false;
         if let Err(e) = execute(session, &line) {
             println!("{e}");
         }
@@ -99,6 +109,46 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
     match args.as_slice() {
         [] => {}
         ["help"] => print_help(),
+
+        // ---- Project ----
+        ["undo"] => println!("undid {}", s.undo()?),
+        ["redo"] => println!("redid {}", s.redo()?),
+        ["history"] => {
+            let (undo, redo) = s.history.labels();
+            if undo.is_empty() && redo.is_empty() {
+                println!("  (nothing yet)");
+            }
+            for label in &undo {
+                println!("  {label}");
+            }
+            println!("  <- you are here");
+            for label in redo.iter().rev() {
+                println!("  {label}  (undone)");
+            }
+        }
+        ["new"] => s.new_project()?,
+        ["save"] => {
+            let path = s.project_path.clone().ok_or("no file yet: save <path>")?;
+            s.save_project(&path)?;
+            println!("saved {}", path.display());
+        }
+        ["save", ..] | ["open", ..] => {
+            // Paths may contain spaces: take the rest of the line.
+            let raw = line.trim_start()[args[0].len()..].trim();
+            let mut path = clean_path(raw);
+            if args[0] == "save" {
+                if !raw.ends_with(".json") {
+                    path = PathBuf::from(format!("{}.{}", path.display(), crate::session::PROJECT_EXTENSION));
+                }
+                s.save_project(&path)?;
+                println!("saved {}", path.display());
+            } else {
+                for w in s.open_project(&path)? {
+                    println!("  warning: {w}");
+                }
+                println!("opened {}", path.display());
+            }
+        }
 
         // ---- Tracks ----
         ["track", "add", name @ ..] => {
@@ -239,6 +289,27 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
         ["arm", "off"] => s.arm(None)?,
         ["arm", t] => s.arm(Some(track_arg(s, t)?))?,
 
+        // ---- Plugins ----
+        ["plugins", "scan"] => {
+            for problem in s.scan_plugins() {
+                println!("  problem: {problem}");
+            }
+            list_plugins(s);
+        }
+        ["plugins"] => list_plugins(s),
+        ["plugin", t, n] => {
+            let target = target_arg(s, t)?;
+            let entry = plugin_arg(s, n)?;
+            let slot = s.add_plugin(target, &entry.path, &entry.descriptor.id, None)?;
+            println!("added {} at slot {slot}", entry.descriptor.name);
+        }
+        ["instrument", t, n] => {
+            let track = track_arg(s, t)?;
+            let entry = plugin_arg(s, n)?;
+            s.set_plugin_instrument(track, &entry.path, &entry.descriptor.id)?;
+            println!("{} is now track {track}'s instrument", entry.descriptor.name);
+        }
+
         // ---- Recording ----
         ["rec", "off"] => s.set_record_track(None)?,
         ["rec", t] => {
@@ -316,6 +387,22 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
     Ok(())
 }
 
+fn plugin_arg(s: &Session, n: &str) -> Result<crate::session::PluginEntry> {
+    let i: usize = num(n, "plugin number")?;
+    s.plugins.get(i).cloned().ok_or_else(|| "no such plugin (see `plugins`; `plugins scan` finds them)".into())
+}
+
+fn list_plugins(s: &Session) {
+    if s.plugins.is_empty() {
+        println!("  (none found yet: `plugins scan` looks in the standard CLAP folders and $CLAP_PATH)");
+    }
+    for (i, p) in s.plugins.iter().enumerate() {
+        let d = &p.descriptor;
+        let kind = if d.is_instrument() { "instrument" } else { "effect" };
+        println!("  {i}: {} ({kind}) by {}  {}", d.name, d.vendor, p.path.display());
+    }
+}
+
 fn list(s: &Session) {
     let targets = (0..MAX_TRACKS).map(Target::Track).chain([Target::Aux, Target::Master]);
     for target in targets {
@@ -340,7 +427,8 @@ fn list(s: &Session) {
         };
         println!("{}  {:+.1} dB{strip}{flags}", target_label(&s.project, target), t.volume_db);
         if let Some(inst) = &t.instrument {
-            println!("    instrument: {}  [{}]", inst.name, inst.params.iter().map(|p| p.name).collect::<Vec<_>>().join(", "));
+            let kind = if inst.plugin.is_some() { " (CLAP)" } else { "" };
+            println!("    instrument: {}{kind}  [{}]", inst.name, inst.params.iter().map(|p| p.name).collect::<Vec<_>>().join(", "));
         }
         for c in &t.midi_clips {
             println!("    midi clip #{}: @ {}  len {:.2} beats  {} notes", c.id, format_bbt(c.start_beat), c.length_beats, c.notes.len());
@@ -403,7 +491,7 @@ mod tests {
         assert_eq!(track.midi_clips.len(), 1);
         assert_eq!(track.slots[0].as_ref().unwrap().values[2], 0.6);
         assert_eq!(track.volume_db, -3.0);
-        assert_eq!(s.loop_range, Some((0.0, 16.0)));
+        assert_eq!(s.project.loop_range, Some((0.0, 16.0)));
     }
 
     #[test]

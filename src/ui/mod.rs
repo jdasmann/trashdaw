@@ -11,6 +11,7 @@
 //! thread can ever block the audio thread.
 
 mod inspector;
+mod menu;
 mod meter;
 mod mixer;
 mod pianoroll;
@@ -47,6 +48,12 @@ pub struct DawApp {
     piano: Option<pianoroll::PianoRoll>,
     input_meter: meter::MeterState,
     punch_bars: (f64, f64),
+    dialog: Option<menu::Dialog>,
+    /// Displayed CPU share per plugin instance (by address), decayed.
+    plugin_cpu: std::collections::HashMap<usize, f32>,
+    /// Set once the user has chosen to quit (after any saving).
+    quit_now: bool,
+    title: String,
 }
 
 impl DawApp {
@@ -65,6 +72,10 @@ impl DawApp {
             piano: None,
             input_meter: meter::MeterState::default(),
             punch_bars: (3.0, 5.0),
+            dialog: None,
+            plugin_cpu: std::collections::HashMap::new(),
+            quit_now: false,
+            title: String::new(),
         }
     }
 
@@ -88,7 +99,10 @@ impl DawApp {
             self.log.push(msg);
         }
         self.handle_input(ctx);
+        self.shortcuts(ctx);
+        self.update_title(ctx);
 
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_ui(ui));
         egui::TopBottomPanel::top("transport").show(ctx, |ui| self.transport_ui(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| ui.label(&self.status));
         egui::TopBottomPanel::bottom("mixer").resizable(true).default_height(270.0).show(ctx, |ui| self.mixer_ui(ui));
@@ -100,6 +114,7 @@ impl DawApp {
             egui::ScrollArea::vertical().show(ui, |ui| self.timeline_ui(ui));
         });
         self.piano_ui(ctx);
+        self.dialogs(ctx);
 
         // Meters and the playhead move on their own, so keep redrawing
         // (about 60 fps). egui otherwise only redraws on input.
@@ -152,7 +167,7 @@ impl DawApp {
             }
             ui.separator();
 
-            let mut looping = self.session.loop_range.is_some();
+            let mut looping = self.session.project.loop_range.is_some();
             let mut changed = ui.checkbox(&mut looping, "loop bars").changed();
             changed |= ui.add(egui::DragValue::new(&mut self.loop_bars.0).speed(0.1).clamp_range(1.0..=999.0)).changed();
             ui.label("to");
@@ -227,6 +242,23 @@ impl DawApp {
 
         ui.separator();
         self.input_ui(ui);
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("Plugins");
+            if ui.small_button("Scan").on_hover_text("look in the standard CLAP folders, and $CLAP_PATH").clicked() {
+                let problems = self.session.scan_plugins();
+                self.status = format!("found {} plugin(s)", self.session.plugins.len());
+                self.log.extend(problems);
+            }
+        });
+        if self.session.plugins.is_empty() {
+            ui.weak("None found yet.");
+        }
+        for p in &self.session.plugins {
+            let kind = if p.descriptor.is_instrument() { "instrument" } else { "effect" };
+            ui.small(format!("{} ({kind})", p.descriptor.name)).on_hover_text(p.path.display().to_string());
+        }
 
         ui.separator();
         ui.strong("MIDI input");
@@ -643,7 +675,7 @@ mod tests {
         }
         assert!(h.app.input_meter.db > -7.0, "the input meter shows the level");
 
-        let audio = Arc::new(crate::loader::AudioData { name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; 48_000]; 2] });
+        let audio = Arc::new(crate::loader::AudioData { path: None, name: "take-001.wav".into(), sample_rate: 48_000.0, channels: vec![vec![0.1; 48_000]; 2] });
         tx.send(Finished { take: 1, track: 0, start_frame: 192_000, path: Ok("recordings/take-001.wav".into()), audio }).unwrap();
         h.frame(vec![]);
         assert!(h.app.status.starts_with("recorded take 1"), "{}", h.app.status);
@@ -675,5 +707,122 @@ mod tests {
         }
         let ppm = h.app.session.drift_ppm().expect("enough history");
         assert!((ppm - 100.0).abs() < 1.0, "{ppm}");
+    }
+
+    // ---- Step 11: undo, saving, quitting ----
+
+    impl Harness {
+        fn key(&mut self, key: Key, modifiers: Modifiers) {
+            let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            self.frame(vec![ev(true), ev(false)]);
+        }
+
+        /// A frame in which the window's close button was pressed.
+        fn close_requested(&mut self) -> egui::FullOutput {
+            self.time += 1.0 / 60.0;
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 860.0))),
+                time: Some(self.time),
+                ..Default::default()
+            };
+            input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+            self.ctx.run(input, |ctx| self.app.ui(ctx))
+        }
+    }
+
+    fn sent_close_command(out: &egui::FullOutput, cmd: egui::ViewportCommand) -> bool {
+        out.viewport_output.get(&egui::ViewportId::ROOT).map_or(false, |v| v.commands.contains(&cmd))
+    }
+
+    #[test]
+    fn keyboard_undo_and_redo() {
+        let mut h = Harness::new(project);
+        h.frame(vec![]);
+        h.app.session.set_volume(Target::Track(0), -12.0).unwrap();
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.app.session.project.tracks[0].as_ref().unwrap().volume_db, 0.0);
+        assert_eq!(h.app.status, "undid volume");
+        h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.session.project.tracks[0].as_ref().unwrap().volume_db, -12.0, "redo, not a second undo");
+        h.key(Key::Z, Modifiers::COMMAND);
+        h.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(h.app.session.project.tracks[0].as_ref().unwrap().volume_db, -12.0, "Ctrl+Y redoes too");
+    }
+
+    #[test]
+    fn the_title_shows_unsaved_changes() {
+        let dir = std::env::temp_dir().join("daw_ui_title");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = Harness::new(project);
+        h.frame(vec![]);
+        assert!(h.app.title.ends_with("untitled •"), "{}", h.app.title);
+        h.app.save_as(&dir.join("song").display().to_string(), menu::Then::Nothing);
+        h.frame(vec![]);
+        assert_eq!(h.app.title, "daw - song.daw.json", "saved: no dot, and the extension added");
+        h.app.session.set_mute(0, true).unwrap();
+        h.frame(vec![]);
+        assert!(h.app.title.ends_with('•'));
+    }
+
+    #[test]
+    fn closing_with_unsaved_work_asks_first() {
+        let mut h = Harness::new(project); // project() makes changes: unsaved
+        h.frame(vec![]);
+        let out = h.close_requested();
+        assert!(sent_close_command(&out, egui::ViewportCommand::CancelClose), "the close was stopped");
+        assert_eq!(h.app.dialog, Some(menu::Dialog::Unsaved { then: menu::Then::Quit }));
+        // "Don't save": now it really closes.
+        h.app.dialog = None;
+        h.app.carry_on(menu::Then::Quit);
+        h.time += 1.0 / 60.0;
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 860.0))), time: Some(h.time), ..Default::default() };
+        let out = h.ctx.run(input, |ctx| h.app.ui(ctx));
+        assert!(sent_close_command(&out, egui::ViewportCommand::Close));
+    }
+
+    #[test]
+    fn closing_with_nothing_to_lose_just_closes() {
+        let mut h = Harness::new(|_| {});
+        h.frame(vec![]);
+        let out = h.close_requested();
+        assert!(!sent_close_command(&out, egui::ViewportCommand::CancelClose));
+        assert_eq!(h.app.dialog, None);
+    }
+
+    #[test]
+    fn new_project_with_unsaved_work_asks_then_clears() {
+        let mut h = Harness::new(project);
+        h.frame(vec![]);
+        h.app.dialog = Some(menu::Dialog::Unsaved { then: menu::Then::New });
+        h.frame(vec![]); // the dialog draws
+        h.app.dialog = None;
+        h.app.carry_on(menu::Then::New);
+        assert!(h.app.session.project.tracks.iter().all(|t| t.is_none()));
+        h.frame(vec![]);
+        assert!(h.app.timeline.clip_rects.is_empty());
+    }
+
+    // ---- Step 12: plugins ----
+
+    #[test]
+    fn plugin_nodes_render_in_the_inspector() {
+        use crate::clap::test_plugin::{BEEP_ID, GAIN_ID};
+        let mut h = Harness::new(|t| {
+            project(t);
+            t.session.register_bundle(crate::clap::tests::example_bundle());
+            let path = std::path::Path::new("example.clap");
+            t.session.add_plugin(Target::Track(1), path, GAIN_ID, None).unwrap();
+            t.session.set_plugin_instrument(1, path, BEEP_ID).unwrap();
+            // And a placeholder for a plugin that couldn't be found.
+            let mut missing = crate::project::NodeInfo::new(crate::clap::intern("org.gone.reverb (missing)"), &[]);
+            missing.plugin = Some(crate::project::PluginInfo { path: "/nowhere/Gone.clap".into(), id: "org.gone.reverb".into(), instance: None, state: None });
+            t.session.project.tracks[1].as_mut().unwrap().slots[9] = Some(missing);
+        });
+        h.app.selected = Target::Track(1);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        assert_eq!(h.app.plugin_cpu.len(), 2, "both live plugins show their load");
     }
 }

@@ -595,7 +595,14 @@ impl Engine {
 
     /// Dropping a Box frees memory, which is not real-time safe, so we
     /// hand old nodes and tracks back to the main thread instead.
-    fn retire(&mut self, item: Garbage) {
+    fn retire(&mut self, mut item: Garbage) {
+        // Plugins must stop processing on THIS thread, before they go.
+        match &mut item {
+            Garbage::Node(node) => node.stop(),
+            Garbage::Instrument(inst) => inst.stop(),
+            Garbage::Track(track) => track.stop_all(),
+            _ => {}
+        }
         // If the queue is somehow full the item is dropped here. That is
         // rare and only a glitch risk; size the queue generously.
         let _ = self.garbage.push(item);
@@ -640,6 +647,8 @@ impl Engine {
     {
         // Flush denormals to zero for this whole callback (see denormal.rs).
         let _no_denormals = crate::denormal::NoDenormals::new();
+        // So plugins asking "am I on the audio thread?" get a true answer.
+        crate::clap::enter_audio_thread();
 
         // Commands take effect at the start of a callback, so they are
         // quantized to the device buffer size. Fine for UI actions.
@@ -989,7 +998,7 @@ mod tests {
         use crate::loader::AudioData;
         let mut h = Harness::new(2);
         h.add_track(0);
-        let data = Arc::new(AudioData { name: "dc".into(), sample_rate: 48_000.0, channels: vec![vec![0.5; 100_000]] });
+        let data = Arc::new(AudioData { path: None, name: "dc".into(), sample_rate: 48_000.0, channels: vec![vec![0.5; 100_000]] });
         let clip = AudioClip::new(data, ClipParams::new(1, 0.0, 4.0), &INFO);
         h.send(Command::SetClips { track: 0, clips: Box::new(ClipList::new(vec![clip])) });
         h.send(Command::SetVolume { target: Target::Track(0), db: -6.0206 });
