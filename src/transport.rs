@@ -20,6 +20,8 @@ pub struct ProcessContext {
     /// Sample position of the first frame in this block.
     pub position: u64,
     pub tempo: f64,
+    /// The loop range in beats, if looping (for plugins that want it).
+    pub loop_beats: Option<(f64, f64)>,
 }
 
 impl ProcessContext {
@@ -127,6 +129,7 @@ impl Transport {
             playing: self.playing,
             position: self.position,
             tempo: self.tempo,
+            loop_beats: self.loop_beats,
         }
     }
 }
@@ -137,6 +140,13 @@ pub struct TransportShared {
     position: AtomicU64,
     playing: AtomicBool,
     tempo_bits: AtomicU64, // f64 stored as raw bits
+    /// Total plugin delay compensation, in frames: how much later than
+    /// the playhead everything is heard.
+    plugin_latency: AtomicU64,
+    /// Allocations caught on the audio thread (debug builds only).
+    rt_violations: AtomicU64,
+    /// Frames in the most recent device callback.
+    callback_frames: AtomicU64,
 }
 
 impl TransportShared {
@@ -145,6 +155,9 @@ impl TransportShared {
             position: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             tempo_bits: AtomicU64::new(120f64.to_bits()),
+            plugin_latency: AtomicU64::new(0),
+            rt_violations: AtomicU64::new(0),
+            callback_frames: AtomicU64::new(0),
         })
     }
 
@@ -166,6 +179,32 @@ impl TransportShared {
 
     pub fn tempo(&self) -> f64 {
         f64::from_bits(self.tempo_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_plugin_latency(&self, frames: u64) {
+        self.plugin_latency.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn plugin_latency(&self) -> u64 {
+        self.plugin_latency.load(Ordering::Relaxed)
+    }
+
+    pub fn add_rt_violations(&self, n: u64) {
+        self.rt_violations.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn rt_violations(&self) -> u64 {
+        self.rt_violations.load(Ordering::Relaxed)
+    }
+
+    pub fn set_callback_frames(&self, frames: u64) {
+        self.callback_frames.store(frames, Ordering::Relaxed);
+    }
+
+    /// How many frames the device asks for per callback: the buffer size,
+    /// and with it the latency of the output (step 1's exercise).
+    pub fn callback_frames(&self) -> u64 {
+        self.callback_frames.load(Ordering::Relaxed)
     }
 }
 

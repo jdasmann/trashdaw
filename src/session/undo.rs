@@ -104,6 +104,11 @@ impl History {
         self.saved = self.current;
     }
 
+    /// For a recovered project: its changes aren't in the real file yet.
+    pub(crate) fn mark_unsaved(&mut self) {
+        self.saved = u64::MAX;
+    }
+
     /// Forgets everything: for a new or freshly loaded project.
     pub(crate) fn reset(&mut self) {
         *self = History::default();
@@ -118,6 +123,12 @@ impl History {
 impl Session {
     /// Runs an edit, and records an undo step if (and only if) it worked.
     fn undoable<T>(&mut self, label: &str, merge: Option<Merge>, edit: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // Every edit passes through here, so this one check covers them all:
+        // a project being loaded is about to replace this one, and an edit
+        // made now would be silently lost.
+        if self.loading.is_some() {
+            return Err("a project is loading: edits will be possible once it's open".into());
+        }
         let before = self.project.clone();
         let result = edit(self);
         if result.is_ok() {

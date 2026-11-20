@@ -24,7 +24,7 @@ fn dc(value: f32) -> AudioBuffer {
 fn a_bundle_lists_its_plugins() {
     let b = example_bundle();
     let names: Vec<&str> = b.descriptors.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, vec!["Example Gain", "Example Beep"]);
+    assert_eq!(names, vec!["Example Gain", "Example Beep", "Example Lookahead"]);
     assert!(!b.descriptors[0].is_instrument());
     assert!(b.descriptors[1].is_instrument());
 }
@@ -173,7 +173,8 @@ fn thread_rules_hold_through_the_real_engine() {
     let violations = records.violations.lock().unwrap().clone();
     assert!(violations.is_empty(), "{violations:?}");
     let calls = records.calls.lock().unwrap().clone();
-    assert_eq!(calls, vec!["init", "params.get_info", "params.get_info", "params.get_info", "activate", "start_processing", "stop_processing", "deactivate", "destroy"]);
+    // latency.get comes right after activate: CLAP only allows it while active.
+    assert_eq!(calls, vec!["init", "params.get_info", "params.get_info", "params.get_info", "activate", "latency.get", "start_processing", "stop_processing", "deactivate", "destroy"]);
     assert_eq!(records.processed_blocks.load(std::sync::atomic::Ordering::Relaxed), 10);
 }
 
@@ -204,7 +205,7 @@ fn interning_keeps_one_copy() {
 fn real_library_loads_from_disk() {
     let path = std::env::var("DAW_TEST_CLAP").expect("set DAW_TEST_CLAP to a .clap file");
     let bundle = Bundle::load(Path::new(&path)).unwrap();
-    assert_eq!(bundle.descriptors.len(), 2);
+    assert_eq!(bundle.descriptors.len(), 3);
     enter_audio_thread();
     let inst = Instance::create(&bundle, GAIN_ID, &INFO).unwrap();
     let mut node = ClapNode::new(inst, &INFO).unwrap();
@@ -236,4 +237,123 @@ fn a_file_that_isnt_a_plugin_is_refused_cleanly() {
     std::fs::write(&path, b"definitely not a shared library").unwrap();
     let err = Bundle::load(&path).err().expect("refused");
     assert!(err.contains("couldn't load"), "{err}");
+}
+
+// ---- Step 12 exercises ----
+
+#[test]
+fn plugins_are_told_where_the_song_is() {
+    use clap_sys::events::{CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING};
+    use clap_sys::fixedpoint::CLAP_BEATTIME_FACTOR;
+    use std::sync::atomic::Ordering::Relaxed;
+    enter_audio_thread();
+    let inst = Instance::create(&example_bundle(), GAIN_ID, &INFO).unwrap();
+    // SAFETY: the plugin is alive.
+    let rec = unsafe { test_plugin::records(inst.raw()) };
+    let mut node = ClapNode::new(inst, &INFO).unwrap();
+    let mut t = Transport::new(48_000.0);
+    t.set_tempo(90.0);
+    t.seek_beats(10.5); // bar 3 (0-based: 2), beat 2.5 of it
+    t.set_loop(Some((8.0, 16.0)));
+    t.playing = true;
+    Processor::process(&mut node, &mut dc(0.1), &t.context());
+    assert_eq!(f64::from_bits(rec.tempo.load(Relaxed)), 90.0);
+    let beats = rec.song_pos_beats.load(Relaxed) as f64 / CLAP_BEATTIME_FACTOR as f64;
+    assert!((beats - 10.5).abs() < 1e-4, "{beats}");
+    assert_eq!(rec.bar_number.load(Relaxed), 2);
+    assert_eq!(rec.loop_end_beats.load(Relaxed), 16 * CLAP_BEATTIME_FACTOR, "fixed point: exact");
+    let flags = rec.transport_flags.load(Relaxed);
+    assert!(flags & CLAP_TRANSPORT_IS_PLAYING != 0 && flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE != 0);
+    Processor::stop(&mut node);
+}
+
+/// Tiny blocks (64 frames = 1.33 ms of budget), and a plugin that burns
+/// 2 ms per call: about 150% of the budget.
+fn slow_plugin(id: &str) -> (Arc<Instance>, Arc<test_plugin::Records>, ClapNode) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let small = PrepareInfo { sample_rate: 48_000.0, max_frames: 64, channels: 2 };
+    let inst = Instance::create(&example_bundle(), id, &small).unwrap();
+    // SAFETY: the plugin is alive.
+    let rec = unsafe { test_plugin::records(inst.raw()) };
+    rec.spin_micros.store(2_000, Relaxed);
+    let node = ClapNode::new(inst.clone(), &small).unwrap();
+    (inst, rec, node)
+}
+
+fn small_dc(value: f32) -> AudioBuffer {
+    let mut b = AudioBuffer::new(2, 64);
+    b.channel_mut(0).fill(value);
+    b.channel_mut(1).fill(value);
+    b
+}
+
+#[test]
+fn the_watchdog_bypasses_a_plugin_that_is_too_slow() {
+    use super::instance::WATCHDOG_BLOCKS;
+    use std::sync::atomic::Ordering::Relaxed;
+    enter_audio_thread();
+    let (inst, rec, mut node) = slow_plugin(GAIN_ID);
+    let ctx = Transport::new(48_000.0).context();
+    Processor::set_param(&mut node, 0, -6.0206); // so the plugin's effect is visible
+    for _ in 0..WATCHDOG_BLOCKS {
+        Processor::process(&mut node, &mut small_dc(0.5), &ctx);
+    }
+    assert!(inst.is_overloaded(), "bypassed after {WATCHDOG_BLOCKS} slow blocks in a row");
+    let mut buf = small_dc(0.5);
+    Processor::process(&mut node, &mut buf, &ctx);
+    assert_eq!(buf.channel(0)[0], 0.5, "an effect is bypassed by passing the audio through");
+    assert_eq!(rec.processed_blocks.load(Relaxed), WATCHDOG_BLOCKS, "the plugin isn't called any more");
+
+    let messages = inst.service();
+    assert!(messages.iter().any(|m| m.contains("bypassed to stop the dropouts")), "{messages:?}");
+    assert!(inst.service().iter().all(|m| !m.contains("bypassed")), "reported once, not every frame");
+
+    rec.spin_micros.store(0, Relaxed); // the user fixes things, and re-enables it
+    inst.reenable();
+    let mut buf = small_dc(0.5);
+    Processor::process(&mut node, &mut buf, &ctx);
+    assert!((buf.channel(0)[0] - 0.25).abs() < 1e-4, "playing again");
+    Processor::stop(&mut node);
+}
+
+#[test]
+fn one_slow_block_is_forgiven() {
+    use std::sync::atomic::Ordering::Relaxed;
+    enter_audio_thread();
+    let (inst, rec, mut node) = slow_plugin(GAIN_ID);
+    let ctx = Transport::new(48_000.0).context();
+    for k in 0..40 {
+        // Slow only every fourth block: never 8 in a row.
+        rec.spin_micros.store(if k % 4 == 0 { 2_000 } else { 0 }, Relaxed);
+        Processor::process(&mut node, &mut small_dc(0.5), &ctx);
+    }
+    assert!(!inst.is_overloaded());
+    Processor::stop(&mut node);
+}
+
+#[test]
+fn a_bypassed_instrument_is_silent() {
+    use super::instance::WATCHDOG_BLOCKS;
+    enter_audio_thread();
+    let (inst, _rec, mut node) = slow_plugin(BEEP_ID);
+    let ctx = Transport::new(48_000.0).context();
+    let on = [MidiEvent { frame: 0, msg: MidiMessage::NoteOn { note: 69, velocity: 100 } }];
+    for k in 0..WATCHDOG_BLOCKS {
+        let mut buf = AudioBuffer::new(2, 64);
+        buf.clear();
+        Instrument::render(&mut node, &mut buf, &ctx, if k == 0 { &on } else { &[] });
+    }
+    assert!(inst.is_overloaded());
+    let mut buf = AudioBuffer::new(2, 64);
+    buf.clear();
+    Instrument::render(&mut node, &mut buf, &ctx, &[]);
+    assert!(buf.channel(0).iter().all(|&s| s == 0.0), "silence: there's nothing to pass through");
+    Instrument::stop(&mut node);
+}
+
+#[test]
+fn plugins_report_their_latency() {
+    let bundle = example_bundle();
+    assert_eq!(Instance::create(&bundle, test_plugin::LOOKAHEAD_ID, &INFO).unwrap().latency, test_plugin::LOOKAHEAD_FRAMES as u32);
+    assert_eq!(Instance::create(&bundle, GAIN_ID, &INFO).unwrap().latency, 0);
 }

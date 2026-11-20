@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn plugins_are_listed_and_added_like_any_effect() {
         let mut t = with_plugins();
-        assert_eq!(t.session.plugins.len(), 2);
+        assert_eq!(t.session.plugins.len(), 3, "gain, beep and lookahead");
         t.session.add_track(None).unwrap();
         let slot = t.session.add_plugin(Target::Track(0), Path::new(PATH), GAIN_ID, None).unwrap();
         let node = t.session.project.tracks[0].as_ref().unwrap().slots[slot].clone().unwrap();

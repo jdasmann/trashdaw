@@ -74,12 +74,22 @@ pub struct Session {
     pub project_path: Option<PathBuf>,
     /// Plugins found on disk (see `scan_plugins`).
     pub plugins: Vec<PluginEntry>,
+    /// A project being opened in the background.
+    loading: Option<file::LoadJob>,
+    /// Audio copied into the project by "collect": its new home.
+    relocated: Vec<(Arc<AudioData>, PathBuf)>,
+    /// Untitled projects' recovery copies go here.
+    pub recovery_dir: PathBuf,
+    pub autosave_every: std::time::Duration,
+    last_autosave: Instant,
     /// Each plugin library, loaded once and shared by its instances.
     bundles: std::collections::HashMap<PathBuf, Arc<crate::clap::Bundle>>,
     /// Record only inside this range (beats).
     pub punch: Option<(f64, f64)>,
     pub monitor: bool,
     pub drift: DriftEstimator,
+    /// Resampling the input onto the output's clock (see DriftCorrector).
+    pub drift_correction: bool,
 }
 
 /// The main thread's end of recording, present when there's an input.
@@ -121,9 +131,15 @@ impl Session {
             project_path: None,
             plugins: Vec::new(),
             bundles: std::collections::HashMap::new(),
+            loading: None,
+            relocated: Vec::new(),
+            recovery_dir: file::default_recovery_dir(),
+            autosave_every: std::time::Duration::from_secs(120),
+            last_autosave: Instant::now(),
             punch: None,
             monitor: false,
             drift: DriftEstimator::default(),
+            drift_correction: false,
         }
     }
 
@@ -178,6 +194,27 @@ impl Session {
         self.send(Command::SetMonitor { on })?;
         self.monitor = on;
         Ok(())
+    }
+
+    /// Resamples the input onto the output's clock, so long takes keep
+    /// time. Off by default: with one device (one clock) there's nothing to
+    /// correct, and resampling would only filter the signal slightly.
+    pub fn set_drift_correction(&mut self, on: bool) -> Result {
+        if on && self.recorder.is_none() {
+            return Err("no input device".into());
+        }
+        // The corrector's memory is allocated here, on the main thread.
+        let corrector = on.then(|| Box::new(crate::record::DriftCorrector::new(65_536)));
+        self.send(Command::SetDriftCorrection { corrector })?;
+        self.drift_correction = on;
+        Ok(())
+    }
+
+    /// The correction being applied, in ppm.
+    pub fn correction_ppm(&self) -> Option<f64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = self.recorder.as_ref().filter(|_| self.drift_correction)?;
+        Some(r.shared.correction_ppm.load(Relaxed) as f64 / 1_000.0)
     }
 
     /// Clock drift between input and output, in ppm, once there are at
@@ -993,7 +1030,11 @@ pub mod tests {
             let (tx, commands) = RingBuffer::<Command>::new(1024);
             let (gtx, grx) = RingBuffer::<Garbage>::new(16);
             let (ltx, lrx) = RingBuffer::<LiveMidi>::new(16);
-            let session = Session::new(INFO, tx, grx, TransportShared::new(), Meters::new(), ltx);
+            let mut session = Session::new(INFO, tx, grx, TransportShared::new(), Meters::new(), ltx);
+            // Never the user's real recovery folder.
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            session.recovery_dir = std::env::temp_dir().join(format!("daw-test-recovery-{}-{n}", std::process::id()));
             Self { session, commands, garbage: gtx, live: lrx }
         }
 
@@ -1306,5 +1347,19 @@ pub mod tests {
         assert!(t.session.set_punch(Some((8.0, 4.0))).is_err());
         t.session.set_punch(Some((4.0, 8.0))).unwrap();
         assert_eq!(t.session.punch, Some((4.0, 8.0)));
+    }
+
+    #[test]
+    fn drift_correction_needs_an_input_and_reaches_the_engine() {
+        let mut t = TestSession::new();
+        assert!(t.session.set_drift_correction(true).is_err(), "nothing to correct without an input");
+        with_recorder(&mut t);
+        t.sent();
+        t.session.set_drift_correction(true).unwrap();
+        assert!(t.session.drift_correction);
+        assert_eq!(t.session.correction_ppm(), Some(0.0));
+        assert_eq!(t.sent(), vec!["other"], "one command, carrying the corrector built here");
+        t.session.set_drift_correction(false).unwrap();
+        assert_eq!(t.session.correction_ppm(), None);
     }
 }
