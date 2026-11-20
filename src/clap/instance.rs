@@ -12,7 +12,10 @@ use clap_sys::events::{
     CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE,
     CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
 };
+use clap_sys::ext::gui::{clap_plugin_gui, clap_window, CLAP_EXT_GUI};
 use clap_sys::ext::latency::{clap_plugin_latency, CLAP_EXT_LATENCY};
+use clap_sys::ext::posix_fd_support::{clap_plugin_posix_fd_support, CLAP_EXT_POSIX_FD_SUPPORT};
+use clap_sys::ext::timer_support::{clap_plugin_timer_support, CLAP_EXT_TIMER_SUPPORT};
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_EXT_AUDIO_PORTS};
 use clap_sys::ext::params::{clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED};
@@ -42,6 +45,9 @@ pub struct Instance {
     pub param_ids: Vec<clap_id>,
     params_ext: *const clap_plugin_params,
     state_ext: *const clap_plugin_state,
+    gui_ext: *const clap_plugin_gui,
+    timer_ext: *const clap_plugin_timer_support,
+    fd_ext: *const clap_plugin_posix_fd_support,
     /// Channels of the main input and output ports (0 input: an instrument).
     pub inputs: u32,
     pub outputs: u32,
@@ -173,6 +179,9 @@ impl Instance {
         // Latency may only be asked once active [main-thread & active].
         let latency_ext = ext(CLAP_EXT_LATENCY) as *const clap_plugin_latency;
         let latency = unsafe { latency_ext.as_ref().and_then(|l| l.get).map_or(0, |g| g(plugin)) };
+        let gui_ext = ext(CLAP_EXT_GUI) as *const clap_plugin_gui;
+        let timer_ext = ext(CLAP_EXT_TIMER_SUPPORT) as *const clap_plugin_timer_support;
+        let fd_ext = ext(CLAP_EXT_POSIX_FD_SUPPORT) as *const clap_plugin_posix_fd_support;
         Ok(Arc::new(Instance {
             plugin,
             name: intern(&descriptor.name),
@@ -181,6 +190,9 @@ impl Instance {
             param_ids,
             params_ext,
             state_ext,
+            gui_ext,
+            timer_ext,
+            fd_ext,
             inputs,
             outputs,
             cpu: AtomicU32::new(0),
@@ -234,6 +246,8 @@ impl Instance {
                 }
             }
         }
+        self.run_timers();
+        self.poll_fds();
         let mut log = self.host.take_log();
         // The watchdog DECIDED on the audio thread; it's REPORTED here,
         // because building a message allocates.
@@ -254,6 +268,160 @@ impl Instance {
     /// time budget went to this plugin.
     pub fn take_cpu(&self) -> f32 {
         f32::from_bits(self.cpu.swap(0, Ordering::Relaxed))
+    }
+
+    /// Calls the plugin back for every timer that's due. [main-thread]
+    fn run_timers(&self) {
+        let Some(on_timer) = (unsafe { self.timer_ext.as_ref() }).and_then(|t| t.on_timer) else { return };
+        let now = Instant::now();
+        // Collect first: the plugin may (un)register timers from inside its
+        // callback, which takes the same lock.
+        let due: Vec<clap_id> = match self.host.timers.lock() {
+            Ok(mut timers) => timers
+                .iter_mut()
+                .filter(|t| t.2 <= now)
+                .map(|t| {
+                    t.2 = now + t.1;
+                    t.0
+                })
+                .collect(),
+            Err(_) => return,
+        };
+        for id in due {
+            // SAFETY: a timer the plugin registered, called on the main thread.
+            unsafe { on_timer(self.plugin, id) };
+        }
+    }
+
+    /// Tells the plugin which of its file descriptors are ready (without
+    /// waiting: this runs once per UI frame). [main-thread]
+    #[cfg(unix)]
+    fn poll_fds(&self) {
+        use clap_sys::ext::posix_fd_support::{CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE};
+        let Some(on_fd) = (unsafe { self.fd_ext.as_ref() }).and_then(|f| f.on_fd) else { return };
+        let watched: Vec<(i32, u32)> = match self.host.fds.lock() {
+            Ok(fds) => fds.clone(),
+            Err(_) => return,
+        };
+        if watched.is_empty() {
+            return;
+        }
+        let mut polls: Vec<libc::pollfd> = watched
+            .iter()
+            .map(|&(fd, flags)| {
+                let mut events = 0;
+                if flags & CLAP_POSIX_FD_READ != 0 {
+                    events |= libc::POLLIN;
+                }
+                if flags & CLAP_POSIX_FD_WRITE != 0 {
+                    events |= libc::POLLOUT;
+                }
+                libc::pollfd { fd, events, revents: 0 }
+            })
+            .collect();
+        // SAFETY: a valid array of pollfd, and a zero timeout.
+        if unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0) } <= 0 {
+            return;
+        }
+        for p in polls.iter().filter(|p| p.revents != 0) {
+            let mut flags = 0;
+            if p.revents & libc::POLLIN != 0 {
+                flags |= CLAP_POSIX_FD_READ;
+            }
+            if p.revents & libc::POLLOUT != 0 {
+                flags |= CLAP_POSIX_FD_WRITE;
+            }
+            if p.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                flags |= CLAP_POSIX_FD_ERROR;
+            }
+            // SAFETY: an fd the plugin registered, on the main thread.
+            unsafe { on_fd(self.plugin, p.fd, flags) };
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn poll_fds(&self) {}
+
+    // ---- GUI [main-thread]: thin wrappers, used by `Editor` ----
+
+    pub fn has_gui(&self) -> bool {
+        !self.gui_ext.is_null()
+    }
+
+    pub(super) fn host_shared(&self) -> &HostShared {
+        &self.host
+    }
+
+    fn gui(&self) -> Option<&clap_plugin_gui> {
+        // SAFETY: the plugin's extension table lives as long as the plugin.
+        unsafe { self.gui_ext.as_ref() }
+    }
+
+    pub(super) fn gui_is_api_supported(&self, api: &CStr, floating: bool) -> bool {
+        self.gui().and_then(|g| g.is_api_supported).map_or(false, |f| unsafe { f(self.plugin, api.as_ptr(), floating) })
+    }
+
+    pub(super) fn gui_create(&self, api: &CStr, floating: bool) -> bool {
+        self.gui().and_then(|g| g.create).map_or(false, |f| unsafe { f(self.plugin, api.as_ptr(), floating) })
+    }
+
+    pub(super) fn gui_destroy(&self) {
+        if let Some(f) = self.gui().and_then(|g| g.destroy) {
+            unsafe { f(self.plugin) }
+        }
+    }
+
+    pub(super) fn gui_set_scale(&self, scale: f64) -> bool {
+        self.gui().and_then(|g| g.set_scale).map_or(false, |f| unsafe { f(self.plugin, scale) })
+    }
+
+    pub(super) fn gui_size(&self) -> Option<(u32, u32)> {
+        let f = self.gui()?.get_size?;
+        let (mut w, mut h) = (0u32, 0u32);
+        unsafe { f(self.plugin, &mut w, &mut h) }.then_some((w, h))
+    }
+
+    pub(super) fn gui_can_resize(&self) -> bool {
+        self.gui().and_then(|g| g.can_resize).map_or(false, |f| unsafe { f(self.plugin) })
+    }
+
+    /// The nearest size the plugin can actually be.
+    pub(super) fn gui_adjust_size(&self, w: u32, h: u32) -> (u32, u32) {
+        let Some(f) = self.gui().and_then(|g| g.adjust_size) else { return (w, h) };
+        let (mut w2, mut h2) = (w, h);
+        if unsafe { f(self.plugin, &mut w2, &mut h2) } {
+            (w2, h2)
+        } else {
+            (w, h)
+        }
+    }
+
+    pub(super) fn gui_set_size(&self, w: u32, h: u32) -> bool {
+        self.gui().and_then(|g| g.set_size).map_or(false, |f| unsafe { f(self.plugin, w, h) })
+    }
+
+    /// SAFETY: `window` must describe a live native window of the API the
+    /// GUI was created with.
+    pub(super) unsafe fn gui_set_parent(&self, window: &clap_window) -> bool {
+        self.gui().and_then(|g| g.set_parent).map_or(false, |f| f(self.plugin, window))
+    }
+
+    /// SAFETY: as for `gui_set_parent`.
+    pub(super) unsafe fn gui_set_transient(&self, window: &clap_window) -> bool {
+        self.gui().and_then(|g| g.set_transient).map_or(false, |f| f(self.plugin, window))
+    }
+
+    pub(super) fn gui_suggest_title(&self, title: &str) {
+        let (Some(f), Ok(t)) = (self.gui().and_then(|g| g.suggest_title), CString::new(title)) else { return };
+        unsafe { f(self.plugin, t.as_ptr()) }
+    }
+
+    pub(super) fn gui_show(&self) -> bool {
+        self.gui().and_then(|g| g.show).map_or(false, |f| unsafe { f(self.plugin) })
+    }
+
+    pub(super) fn gui_hide(&self) -> bool {
+        self.gui().and_then(|g| g.hide).map_or(false, |f| unsafe { f(self.plugin) })
     }
 
     pub fn is_overloaded(&self) -> bool {

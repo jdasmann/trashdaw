@@ -20,14 +20,20 @@
 //! DAW crashes; if it takes too long, the audio drops out. Hosts that need
 //! protection (Bitwig, for example) run plugins in separate processes.
 
+pub mod editor;
 mod instance;
 #[cfg(test)]
 pub mod test_plugin;
+pub mod window;
 
+pub use editor::Editor;
 pub use instance::{ClapNode, Instance};
 
 use clap_sys::entry::clap_plugin_entry;
+use clap_sys::ext::gui::{clap_host_gui, CLAP_EXT_GUI};
 use clap_sys::ext::log::{clap_host_log, clap_log_severity, CLAP_EXT_LOG, CLAP_LOG_ERROR, CLAP_LOG_WARNING};
+use clap_sys::ext::posix_fd_support::{clap_host_posix_fd_support, clap_posix_fd_flags, CLAP_EXT_POSIX_FD_SUPPORT};
+use clap_sys::ext::timer_support::{clap_host_timer_support, CLAP_EXT_TIMER_SUPPORT};
 use clap_sys::ext::params::{clap_host_params, clap_param_clear_flags, clap_param_rescan_flags, CLAP_EXT_PARAMS};
 use clap_sys::ext::thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
@@ -94,6 +100,27 @@ pub struct HostShared {
     /// thread, so it only ever *tries* the lock and drops the message if
     /// it's contended: a plugin's log line isn't worth a dropout.
     pub log: Mutex<Vec<String>>,
+    /// What the plugin's GUI has asked of us (see editor.rs).
+    pub gui: GuiRequests,
+    /// Timers the plugin registered [main-thread]: (id, period, next due).
+    pub timers: Mutex<Vec<(clap_id, std::time::Duration, std::time::Instant)>>,
+    next_timer: std::sync::atomic::AtomicU32,
+    /// File descriptors the plugin wants watched [main-thread]: on Linux,
+    /// a plugin GUI's connection to the X server.
+    pub fds: Mutex<Vec<(i32, clap_posix_fd_flags)>>,
+}
+
+/// Requests from a plugin's GUI, picked up by its `Editor` every frame.
+#[derive(Default)]
+pub struct GuiRequests {
+    pub resize: Mutex<Option<(u32, u32)>>,
+    pub show: AtomicBool,
+    pub hide: AtomicBool,
+    pub hints_changed: AtomicBool,
+    /// The plugin's own (floating) window was closed by the user.
+    pub closed: AtomicBool,
+    /// ...and the plugin already destroyed its GUI.
+    pub closed_destroyed: AtomicBool,
 }
 
 impl HostShared {
@@ -115,6 +142,10 @@ impl HostShared {
             callback_requested: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
             log: Mutex::new(Vec::new()),
+            gui: GuiRequests::default(),
+            timers: Mutex::new(Vec::new()),
+            next_timer: std::sync::atomic::AtomicU32::new(1),
+            fds: Mutex::new(Vec::new()),
         });
         let me: *mut HostShared = &mut *host;
         host.clap_host.host_data = me.cast();
@@ -157,6 +188,12 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
         &LOG as *const clap_host_log as *const c_void
     } else if id == CLAP_EXT_PARAMS {
         &PARAMS as *const clap_host_params as *const c_void
+    } else if id == CLAP_EXT_GUI {
+        &GUI as *const clap_host_gui as *const c_void
+    } else if id == CLAP_EXT_TIMER_SUPPORT {
+        &TIMERS as *const clap_host_timer_support as *const c_void
+    } else if id == CLAP_EXT_POSIX_FD_SUPPORT && cfg!(unix) {
+        &FDS as *const clap_host_posix_fd_support as *const c_void
     } else {
         std::ptr::null() // anything else: "not supported", which plugins must handle
     }
@@ -210,6 +247,111 @@ static PARAMS: clap_host_params = clap_host_params { rescan: Some(params_rescan)
 unsafe extern "C" fn params_rescan(_host: *const clap_host, _flags: clap_param_rescan_flags) {}
 unsafe extern "C" fn params_clear(_host: *const clap_host, _id: clap_id, _flags: clap_param_clear_flags) {}
 unsafe extern "C" fn params_request_flush(_host: *const clap_host) {}
+
+// The plugin's GUI asking things of us. These may come from any thread, so
+// they only set flags; the editor acts on them on the main thread.
+static GUI: clap_host_gui = clap_host_gui {
+    resize_hints_changed: Some(gui_hints_changed),
+    request_resize: Some(gui_request_resize),
+    request_show: Some(gui_request_show),
+    request_hide: Some(gui_request_hide),
+    closed: Some(gui_closed),
+};
+
+unsafe extern "C" fn gui_hints_changed(host: *const clap_host) {
+    if let Some(h) = shared(host) {
+        h.gui.hints_changed.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn gui_request_resize(host: *const clap_host, width: u32, height: u32) -> bool {
+    let Some(h) = shared(host) else { return false };
+    match h.gui.resize.lock() {
+        Ok(mut r) => {
+            *r = Some((width, height));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+unsafe extern "C" fn gui_request_show(host: *const clap_host) -> bool {
+    shared(host).map_or(false, |h| {
+        h.gui.show.store(true, Ordering::Relaxed);
+        true
+    })
+}
+
+unsafe extern "C" fn gui_request_hide(host: *const clap_host) -> bool {
+    shared(host).map_or(false, |h| {
+        h.gui.hide.store(true, Ordering::Relaxed);
+        true
+    })
+}
+
+unsafe extern "C" fn gui_closed(host: *const clap_host, was_destroyed: bool) {
+    if let Some(h) = shared(host) {
+        h.gui.closed_destroyed.store(was_destroyed, Ordering::Relaxed);
+        h.gui.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+// Timers and file descriptors [main-thread]. On Linux there's no shared
+// GUI event loop: a plugin's GUI relies on the host to call it back
+// regularly (timers, for animation) and when its connection to the X server
+// has events (file descriptors). Both are serviced in `Instance::service`.
+static TIMERS: clap_host_timer_support = clap_host_timer_support { register_timer: Some(timer_register), unregister_timer: Some(timer_unregister) };
+
+unsafe extern "C" fn timer_register(host: *const clap_host, period_ms: u32, timer_id: *mut clap_id) -> bool {
+    let (Some(h), false) = (shared(host), timer_id.is_null()) else { return false };
+    let id = h.next_timer.fetch_add(1, Ordering::Relaxed);
+    // At least one UI frame: that's how often they're serviced anyway.
+    let period = std::time::Duration::from_millis(period_ms.max(16) as u64);
+    let Ok(mut timers) = h.timers.lock() else { return false };
+    timers.push((id, period, std::time::Instant::now() + period));
+    *timer_id = id;
+    true
+}
+
+unsafe extern "C" fn timer_unregister(host: *const clap_host, timer_id: clap_id) -> bool {
+    let Some(h) = shared(host) else { return false };
+    let Ok(mut timers) = h.timers.lock() else { return false };
+    let before = timers.len();
+    timers.retain(|t| t.0 != timer_id);
+    timers.len() != before
+}
+
+static FDS: clap_host_posix_fd_support = clap_host_posix_fd_support { register_fd: Some(fd_register), modify_fd: Some(fd_modify), unregister_fd: Some(fd_unregister) };
+
+unsafe extern "C" fn fd_register(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    let Some(h) = shared(host) else { return false };
+    let Ok(mut fds) = h.fds.lock() else { return false };
+    if fds.iter().any(|f| f.0 == fd) {
+        return false;
+    }
+    fds.push((fd, flags));
+    true
+}
+
+unsafe extern "C" fn fd_modify(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    let Some(h) = shared(host) else { return false };
+    let Ok(mut fds) = h.fds.lock() else { return false };
+    match fds.iter_mut().find(|f| f.0 == fd) {
+        Some(f) => {
+            f.1 = flags;
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe extern "C" fn fd_unregister(host: *const clap_host, fd: i32) -> bool {
+    let Some(h) = shared(host) else { return false };
+    let Ok(mut fds) = h.fds.lock() else { return false };
+    let before = fds.len();
+    fds.retain(|f| f.0 != fd);
+    fds.len() != before
+}
 
 // ---------------------------------------------------------------------
 // Bundles: a loaded plugin library.

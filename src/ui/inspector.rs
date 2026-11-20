@@ -212,6 +212,13 @@ impl DawApp {
             });
             return;
         }
+        if inst.has_gui() {
+            let open = self.session.editor_open(inst);
+            if ui.small_button(if open { "Close GUI" } else { "Show GUI" }).on_hover_text("the plugin's own interface, in its own window").clicked() {
+                let r = self.session.toggle_editor(inst);
+                self.report(r);
+            }
+        }
         if inst.latency > 0 {
             let ms = inst.latency as f64 * 1000.0 / self.session.sample_rate;
             ui.small(format!("latency {} frames ({ms:.1} ms): other tracks are delayed to match", inst.latency));
