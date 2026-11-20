@@ -84,6 +84,10 @@ pub struct Session {
     last_autosave: Instant,
     /// Each plugin library, loaded once and shared by its instances.
     bundles: std::collections::HashMap<PathBuf, Arc<crate::clap::Bundle>>,
+    /// Plugin GUIs that are open.
+    editors: Vec<crate::clap::Editor>,
+    /// The main window, for floating plugin windows to stay in front of.
+    parent_window: Option<crate::clap::window::ParentWindow>,
     /// Record only inside this range (beats).
     pub punch: Option<(f64, f64)>,
     pub monitor: bool,
@@ -131,6 +135,8 @@ impl Session {
             project_path: None,
             plugins: Vec::new(),
             bundles: std::collections::HashMap::new(),
+            editors: Vec::new(),
+            parent_window: None,
             loading: None,
             relocated: Vec::new(),
             recovery_dir: file::default_recovery_dir(),

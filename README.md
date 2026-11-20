@@ -101,6 +101,14 @@ lock to the song. Plugins that add latency (look-ahead limiters and the
 like) are compensated: other tracks are delayed to match, and the total
 shows in the left panel.
 
+**Plugin GUIs**: a plugin with its own interface gets a **Show GUI**
+button in the inspector. It opens embedded in a window of its own, which
+follows the plugin's size (and asks the plugin when you resize it), or, if
+the plugin prefers, in the plugin's own floating window, kept in front of
+the DAW's. Embedded GUIs work on Linux (X11) for now; on macOS and Windows,
+plugins that can open their own floating window show their GUI, and
+embedding is coming next. Example Gain has a GUI on Linux.
+
 A plugin runs inside the DAW's process: a crashing plugin takes the DAW
 with it, and a slow one causes dropouts. The inspector shows each plugin's
 share of the time budget. A plugin that reports an error is bypassed, and
@@ -113,7 +121,14 @@ blocks in a row (re-enable it from the inspector).
     cargo test --release bench -- --ignored --nocapture --test-threads=1
 
 The UI tests drive real egui frames with synthetic mouse and keyboard
-input, without opening a window.
+input, without opening a window. The plugin GUI tests use real X11
+windows; on a machine without a display they skip (with a note), and they
+run headlessly under Xvfb:
+
+    Xvfb :99 -noreset & DISPLAY=:99 cargo test
+
+(`-noreset` matters: a bare Xvfb resets itself whenever its last client
+disconnects, refusing connections while it does.)
 
 Tests and debug builds also check the audio thread's central rule: it must
 never allocate or free memory. A checking allocator counts any allocation
@@ -145,7 +160,8 @@ happens (`device` in the command line reports it too).
       loader.rs      audio file decoding (symphonia)
       record.rs      recording: latency compensation, WAV writer, disk
                      thread, clock-drift measurement and correction
-      clap/          CLAP plugin hosting: loading, instances, the plugin node
+      clap/          CLAP plugin hosting: loading, instances, the plugin node,
+                     plugin GUIs (editor.rs) and their windows (window.rs)
       denormal.rs    flush-to-zero guard for the audio thread
       rtcheck.rs     the no-allocation check for the audio thread
       bench.rs       offline benchmarks (tests only)

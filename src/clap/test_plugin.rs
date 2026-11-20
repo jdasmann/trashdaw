@@ -115,6 +115,14 @@ pub struct Records {
     /// A test-only knob: burn this many microseconds in every `process`,
     /// to play a plugin that's too slow.
     pub spin_micros: AtomicU32,
+    /// The GUI's X11 window (0 = none), its size, and how often the host
+    /// called its timer and file descriptor back.
+    pub gui_window: AtomicU32,
+    pub gui_size: AtomicU64,
+    pub timer_ticks: AtomicU32,
+    pub fd_events: AtomicU32,
+    /// Test knob: the GUI asks the host for this size on its next timer.
+    pub want_resize: Mutex<Option<(u32, u32)>>,
 }
 
 impl Default for Records {
@@ -132,6 +140,11 @@ impl Default for Records {
             bar_number: AtomicI32::new(0),
             loop_end_beats: AtomicI64::new(0),
             spin_micros: AtomicU32::new(0),
+            gui_window: AtomicU32::new(0),
+            gui_size: AtomicU64::new(0),
+            timer_ticks: AtomicU32::new(0),
+            fd_events: AtomicU32::new(0),
+            want_resize: Mutex::new(None),
         }
     }
 }
@@ -169,6 +182,10 @@ struct Example {
     active: AtomicBool,
     processing: AtomicBool,
     delay: DelayLine,
+    /// The GUI (Example Gain only, on Linux). [main-thread] only, so the
+    /// lock is never contended.
+    #[cfg(target_os = "linux")]
+    gui: Mutex<Option<x11gui::Gui>>,
 }
 
 impl Example {
@@ -388,6 +405,8 @@ unsafe extern "C" fn get_extension(_p: *const clap_plugin, id: *const c_char) ->
         &STATE as *const clap_plugin_state as *const c_void
     } else if id == CLAP_EXT_LATENCY {
         &LATENCY as *const clap_plugin_latency as *const c_void
+    } else if let Some(ext) = x11gui::extension(_p, id) {
+        ext
     } else {
         std::ptr::null()
     }
@@ -594,6 +613,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         active: AtomicBool::new(false),
         processing: AtomicBool::new(false),
         delay: DelayLine(UnsafeCell::new(([vec![0.0; LOOKAHEAD_FRAMES], vec![0.0; LOOKAHEAD_FRAMES]], 0))),
+        #[cfg(target_os = "linux")]
+        gui: Mutex::new(None),
     });
     let raw = Box::into_raw(me);
     (*raw).clap.plugin_data = raw as *mut c_void;
@@ -621,3 +642,275 @@ pub const ENTRY_DEF: clap_plugin_entry = clap_plugin_entry { clap_version: CLAP_
 
 /// The entry point, for compiling the plugins into the host's tests.
 pub static ENTRY: clap_plugin_entry = ENTRY_DEF;
+
+
+// ---- GUI: Example Gain draws a window (Linux / X11) ----
+//
+// A real plugin GUI, minimal: its own connection to the X server, a window
+// (embedded in the host's, or floating), a timer and its connection's file
+// descriptor registered with the host so it gets called back.
+
+#[cfg(not(target_os = "linux"))]
+mod x11gui {
+    use super::*;
+    pub unsafe fn extension(_p: *const clap_plugin, _id: &CStr) -> Option<*const c_void> {
+        None // no GUI outside Linux: the plugin still compiles and works
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod x11gui {
+    use super::*;
+    use clap_sys::ext::gui::{clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window, CLAP_EXT_GUI, CLAP_WINDOW_API_X11};
+    use clap_sys::ext::posix_fd_support::{clap_host_posix_fd_support, clap_plugin_posix_fd_support, CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_READ};
+    use clap_sys::ext::timer_support::{clap_host_timer_support, clap_plugin_timer_support, CLAP_EXT_TIMER_SUPPORT};
+    use std::os::unix::io::AsRawFd;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, PropMode, WindowClass};
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    pub struct Gui {
+        conn: RustConnection,
+        pixel: u32,
+        floating: bool,
+        window: Option<u32>,
+        size: (u32, u32),
+        timer: Option<clap_id>,
+        fd: i32,
+    }
+
+    pub unsafe fn extension(p: *const clap_plugin, id: &CStr) -> Option<*const c_void> {
+        if Example::from(p).kind != Kind::Gain {
+            return None; // only Example Gain has a GUI
+        }
+        if id == CLAP_EXT_GUI {
+            Some(&GUI as *const clap_plugin_gui as *const c_void)
+        } else if id == CLAP_EXT_TIMER_SUPPORT {
+            Some(&TIMER as *const clap_plugin_timer_support as *const c_void)
+        } else if id == CLAP_EXT_POSIX_FD_SUPPORT {
+            Some(&FD as *const clap_plugin_posix_fd_support as *const c_void)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn host_ext<'a, T>(me: &Example, id: &CStr) -> Option<&'a T> {
+        let get = (*me.host).get_extension?;
+        (get(me.host, id.as_ptr()) as *const T).as_ref()
+    }
+
+    static GUI: clap_plugin_gui = clap_plugin_gui {
+        is_api_supported: Some(is_api_supported),
+        get_preferred_api: Some(get_preferred_api),
+        create: Some(create),
+        destroy: Some(destroy),
+        set_scale: Some(set_scale),
+        get_size: Some(get_size),
+        can_resize: Some(can_resize),
+        get_resize_hints: Some(get_resize_hints),
+        adjust_size: Some(adjust_size),
+        set_size: Some(set_size),
+        set_parent: Some(set_parent),
+        set_transient: Some(set_transient),
+        suggest_title: Some(suggest_title),
+        show: Some(show),
+        hide: Some(hide),
+    };
+
+    unsafe extern "C" fn is_api_supported(_p: *const clap_plugin, api: *const c_char, _floating: bool) -> bool {
+        CStr::from_ptr(api) == CLAP_WINDOW_API_X11 // both embedded and floating
+    }
+
+    unsafe extern "C" fn get_preferred_api(_p: *const clap_plugin, api: *mut *const c_char, floating: *mut bool) -> bool {
+        *api = CLAP_WINDOW_API_X11.as_ptr();
+        *floating = false;
+        true
+    }
+
+    fn with_gui<R>(p: *const clap_plugin, f: impl FnOnce(&Example, &mut Gui) -> R) -> Option<R> {
+        // SAFETY: called by the host with a live plugin.
+        let me = unsafe { Example::from(p) };
+        let mut gui = me.gui.lock().ok()?;
+        gui.as_mut().map(|g| f(me, g))
+    }
+
+    impl Gui {
+        fn make_window(&mut self, parent: u32, records: &Records) -> Option<u32> {
+            let id = self.conn.generate_id().ok()?;
+            let aux = CreateWindowAux::new().background_pixel(self.pixel);
+            let (w, h) = (self.size.0 as u16, self.size.1 as u16);
+            self.conn.create_window(x11rb::COPY_DEPTH_FROM_PARENT, id, parent, 0, 0, w, h, 0, WindowClass::INPUT_OUTPUT, 0, &aux).ok()?;
+            self.conn.flush().ok()?;
+            self.window = Some(id);
+            records.gui_window.store(id, Ordering::Relaxed);
+            Some(id)
+        }
+    }
+
+    unsafe extern "C" fn create(p: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+        let me = Example::from(p);
+        me.check("gui.create", Expect::Main);
+        if CStr::from_ptr(api) != CLAP_WINDOW_API_X11 {
+            return false;
+        }
+        let Ok((conn, screen)) = x11rb::connect(None) else { return false };
+        let (root, pixel) = (conn.setup().roots[screen].root, conn.setup().roots[screen].white_pixel);
+        let fd = conn.stream().as_raw_fd();
+        let mut gui = Gui { conn, pixel, floating, window: None, size: (400, 300), timer: None, fd };
+        // Ask to be called back: a timer (for "animation"), and when the X
+        // connection has events. On Linux the host drives both.
+        if let Some(t) = host_ext::<clap_host_timer_support>(me, CLAP_EXT_TIMER_SUPPORT).and_then(|t| t.register_timer) {
+            let mut id = 0;
+            if t(me.host, 30, &mut id) {
+                gui.timer = Some(id);
+            }
+        }
+        if let Some(r) = host_ext::<clap_host_posix_fd_support>(me, CLAP_EXT_POSIX_FD_SUPPORT).and_then(|f| f.register_fd) {
+            r(me.host, fd, CLAP_POSIX_FD_READ);
+        }
+        if floating && gui.make_window(root, &me.records).is_none() {
+            return false;
+        }
+        me.records.gui_size.store((400u64 << 32) | 300, Ordering::Relaxed);
+        *me.gui.lock().unwrap() = Some(gui);
+        true
+    }
+
+    unsafe extern "C" fn destroy(p: *const clap_plugin) {
+        let me = Example::from(p);
+        me.check("gui.destroy", Expect::Main);
+        let Some(gui) = me.gui.lock().unwrap().take() else { return };
+        if let Some(id) = gui.timer {
+            if let Some(u) = host_ext::<clap_host_timer_support>(me, CLAP_EXT_TIMER_SUPPORT).and_then(|t| t.unregister_timer) {
+                u(me.host, id);
+            }
+        }
+        if let Some(u) = host_ext::<clap_host_posix_fd_support>(me, CLAP_EXT_POSIX_FD_SUPPORT).and_then(|f| f.unregister_fd) {
+            u(me.host, gui.fd);
+        }
+        if let Some(w) = gui.window {
+            let _ = gui.conn.destroy_window(w);
+            let _ = gui.conn.flush();
+        }
+        me.records.gui_window.store(0, Ordering::Relaxed);
+    }
+
+    unsafe extern "C" fn set_scale(_p: *const clap_plugin, _scale: f64) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn get_size(p: *const clap_plugin, w: *mut u32, h: *mut u32) -> bool {
+        with_gui(p, |_, g| {
+            *w = g.size.0;
+            *h = g.size.1;
+        })
+        .is_some()
+    }
+
+    unsafe extern "C" fn can_resize(_p: *const clap_plugin) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn get_resize_hints(_p: *const clap_plugin, hints: *mut clap_gui_resize_hints) -> bool {
+        (*hints).can_resize_horizontally = true;
+        (*hints).can_resize_vertically = true;
+        (*hints).preserve_aspect_ratio = false;
+        true
+    }
+
+    /// Between 200x150 and 1600x1200: hosts must ask, not assume.
+    unsafe extern "C" fn adjust_size(_p: *const clap_plugin, w: *mut u32, h: *mut u32) -> bool {
+        *w = (*w).clamp(200, 1600);
+        *h = (*h).clamp(150, 1200);
+        true
+    }
+
+    unsafe extern "C" fn set_size(p: *const clap_plugin, w: u32, h: u32) -> bool {
+        Example::from(p).check("gui.set_size", Expect::Main);
+        with_gui(p, |me, g| {
+            g.size = (w, h);
+            me.records.gui_size.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+            if let Some(win) = g.window {
+                let _ = g.conn.configure_window(win, &ConfigureWindowAux::new().width(w).height(h));
+                let _ = g.conn.flush();
+            }
+        })
+        .is_some()
+    }
+
+    unsafe extern "C" fn set_parent(p: *const clap_plugin, window: *const clap_window) -> bool {
+        Example::from(p).check("gui.set_parent", Expect::Main);
+        let parent = (*window).specific.x11 as u32;
+        with_gui(p, |me, g| !g.floating && g.make_window(parent, &me.records).is_some()).unwrap_or(false)
+    }
+
+    unsafe extern "C" fn set_transient(p: *const clap_plugin, window: *const clap_window) -> bool {
+        let parent = (*window).specific.x11 as u32;
+        with_gui(p, |_, g| {
+            let Some(win) = g.window.filter(|_| g.floating) else { return false };
+            let ok = g.conn.change_property32(PropMode::REPLACE, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, &[parent]).is_ok();
+            let _ = g.conn.flush();
+            ok
+        })
+        .unwrap_or(false)
+    }
+
+    unsafe extern "C" fn suggest_title(p: *const clap_plugin, title: *const c_char) {
+        let title = CStr::from_ptr(title).to_bytes().to_vec();
+        with_gui(p, |_, g| {
+            if let Some(win) = g.window {
+                let _ = g.conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, &title);
+                let _ = g.conn.flush();
+            }
+        });
+    }
+
+    unsafe extern "C" fn show(p: *const clap_plugin) -> bool {
+        Example::from(p).check("gui.show", Expect::Main);
+        with_gui(p, |_, g| {
+            let Some(win) = g.window else { return false };
+            let _ = g.conn.map_window(win);
+            g.conn.flush().is_ok()
+        })
+        .unwrap_or(false)
+    }
+
+    unsafe extern "C" fn hide(p: *const clap_plugin) -> bool {
+        Example::from(p).check("gui.hide", Expect::Main);
+        with_gui(p, |_, g| {
+            if let Some(win) = g.window {
+                let _ = g.conn.unmap_window(win);
+                let _ = g.conn.flush();
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    static TIMER: clap_plugin_timer_support = clap_plugin_timer_support { on_timer: Some(on_timer) };
+
+    /// The "animation" timer. If a test asked for a resize, the GUI asks
+    /// the host for it here, the way a plugin would on its own.
+    unsafe extern "C" fn on_timer(p: *const clap_plugin, _id: clap_id) {
+        let me = Example::from(p);
+        me.check("gui.on_timer", Expect::Main);
+        me.records.timer_ticks.fetch_add(1, Ordering::Relaxed);
+        let wanted = me.records.want_resize.lock().unwrap().take();
+        if let Some((w, h)) = wanted {
+            let accepted = host_ext::<clap_host_gui>(me, CLAP_EXT_GUI).and_then(|g| g.request_resize).map_or(false, |r| r(me.host, w, h));
+            if accepted {
+                set_size(p, w, h); // accepted: resize our own view to match
+            }
+        }
+    }
+
+    static FD: clap_plugin_posix_fd_support = clap_plugin_posix_fd_support { on_fd: Some(on_fd) };
+
+    unsafe extern "C" fn on_fd(p: *const clap_plugin, _fd: i32, _flags: u32) {
+        let me = Example::from(p);
+        me.check("gui.on_fd", Expect::Main);
+        me.records.fd_events.fetch_add(1, Ordering::Relaxed);
+        with_gui(p, |_, g| while let Ok(Some(_)) = g.conn.poll_for_event() {});
+    }
+}

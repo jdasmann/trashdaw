@@ -2,7 +2,7 @@
 //! building engine nodes for them (for edits, undo, and loading projects).
 
 use super::{Result, Session};
-use crate::clap::{self, Bundle, ClapNode, Descriptor, Instance};
+use crate::clap::{self, Bundle, ClapNode, Descriptor, Editor, Instance};
 use crate::engine::Command;
 use crate::mixer::{Target, MAX_SLOTS};
 use crate::nodes;
@@ -11,6 +11,10 @@ use crate::project::{NodeInfo, PluginInfo};
 use crate::synth::Synth;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn holds(n: &NodeInfo, inst: &Arc<Instance>) -> bool {
+    n.plugin.as_ref().and_then(|p| p.instance.as_ref()).map_or(false, |i| Arc::ptr_eq(i, inst))
+}
 
 /// A plugin found on disk.
 #[derive(Clone, Debug)]
@@ -107,9 +111,50 @@ impl Session {
         self.drop_lanes(Target::Track(track), |t| matches!(t, crate::automation::AutoTarget::Instrument { .. }))
     }
 
+    pub fn set_parent_window(&mut self, parent: Option<crate::clap::window::ParentWindow>) {
+        self.parent_window = parent;
+    }
+
+    pub fn editor_open(&self, inst: &Arc<Instance>) -> bool {
+        self.editors.iter().any(|e| Arc::ptr_eq(e.instance(), inst))
+    }
+
+    /// Opens a plugin's own GUI, or closes it if it's open. Returns whether
+    /// it's open now. [main-thread], like every GUI call.
+    pub fn toggle_editor(&mut self, inst: &Arc<Instance>) -> Result<bool> {
+        if let Some(i) = self.editors.iter().position(|e| Arc::ptr_eq(e.instance(), inst)) {
+            self.editors.remove(i); // dropping it closes it
+            return Ok(false);
+        }
+        let track = self.project.tracks.iter().flatten().find(|t| t.instrument.iter().chain(t.slots.iter().flatten()).any(|n| holds(n, inst)));
+        let title = match track {
+            Some(t) => format!("{} - {}", inst.name, t.name),
+            None => inst.name.to_string(),
+        };
+        let editor = Editor::open(inst.clone(), &title, self.parent_window, false)?;
+        self.editors.push(editor);
+        Ok(true)
+    }
+
+    /// Keeps open GUIs running, and closes those whose window was closed, or
+    /// whose plugin has left the project (removed, undone, another project
+    /// opened): a GUI for a plugin you can't see would just be confusing.
+    fn service_editors(&mut self) {
+        let mut live: Vec<Arc<Instance>> = Vec::new();
+        for t in self.project.tracks.iter().flatten().chain([&self.project.aux, &self.project.master]) {
+            for n in t.slots.iter().flatten().chain(t.instrument.iter()) {
+                if let Some(i) = n.plugin.as_ref().and_then(|p| p.instance.clone()) {
+                    live.push(i);
+                }
+            }
+        }
+        self.editors.retain_mut(|e| live.iter().any(|i| Arc::ptr_eq(i, e.instance())) && e.service());
+    }
+
     /// Answers plugins' requests (on_main_thread callbacks) and passes on
     /// what they logged. Called with `collect_garbage`, regularly.
     pub(super) fn service_plugins(&mut self) {
+        self.service_editors();
         let mut live: Vec<Arc<Instance>> = Vec::new();
         let mut add = |n: &Option<NodeInfo>| {
             if let Some(inst) = n.as_ref().and_then(|n| n.plugin.as_ref()).and_then(|p| p.instance.clone()) {
@@ -388,5 +433,46 @@ mod real_library {
         let node = b.session.project.tracks[0].as_ref().unwrap().slots[0].clone().unwrap();
         assert_eq!(node.name, "Example Gain");
         assert!(node.plugin.unwrap().instance.is_some());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod editor_tests {
+    use super::*;
+    use crate::clap::test_plugin::GAIN_ID;
+    use crate::session::tests::TestSession;
+
+    #[test]
+    fn editors_open_close_and_follow_their_plugin() {
+        // A display that's set AND reachable (a dead X server would fail
+        // the test for reasons that have nothing to do with the code). The
+        // connection is also KEPT for the whole test, standing in for the
+        // DAW's own window: a bare Xvfb resets itself whenever its last
+        // client disconnects, and refuses connections while it does.
+        let Ok(_stand_in_for_the_main_window) = x11rb::connect(None) else {
+            eprintln!("no X display: skipping plugin GUI test (run under Xvfb to include it)");
+            return;
+        };
+        let mut t = TestSession::new();
+        t.session.register_bundle(crate::clap::tests::example_bundle());
+        t.session.add_track(Some("Vocals".into())).unwrap();
+        let slot = t.session.add_plugin(Target::Track(0), Path::new("example.clap"), GAIN_ID, None).unwrap();
+        let inst = t.session.project.tracks[0].as_ref().unwrap().slots[slot].as_ref().unwrap().plugin.as_ref().unwrap().instance.clone().unwrap();
+        assert!(t.session.toggle_editor(&inst).unwrap(), "opened");
+        assert!(t.session.editor_open(&inst));
+        t.session.collect_garbage(); // a UI frame
+        assert!(t.session.editor_open(&inst), "stays open");
+        assert!(!t.session.toggle_editor(&inst).unwrap(), "closed");
+
+        // Removing the plugin closes its GUI; so does undoing it back out.
+        t.session.toggle_editor(&inst).unwrap();
+        t.session.remove_node(Target::Track(0), slot).unwrap();
+        t.session.collect_garbage();
+        assert!(!t.session.editor_open(&inst), "the plugin left the project");
+        t.session.undo().unwrap();
+        t.session.toggle_editor(&inst).unwrap();
+        t.session.undo().unwrap(); // undoes the plugin's addition
+        t.session.collect_garbage();
+        assert!(!t.session.editor_open(&inst));
     }
 }

@@ -357,3 +357,139 @@ fn plugins_report_their_latency() {
     assert_eq!(Instance::create(&bundle, test_plugin::LOOKAHEAD_ID, &INFO).unwrap().latency, test_plugin::LOOKAHEAD_FRAMES as u32);
     assert_eq!(Instance::create(&bundle, GAIN_ID, &INFO).unwrap().latency, 0);
 }
+
+// ---- Plugin GUIs, against a real X server (Xvfb in CI) ----
+
+#[cfg(target_os = "linux")]
+mod gui {
+    use super::*;
+    use crate::clap::window::ParentWindow;
+    use crate::clap::Editor;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, EventMask, MapState, WindowClass};
+    use x11rb::rust_connection::RustConnection;
+
+    /// An outside observer of the X server: what the window manager or the
+    /// user would see and do. None (skip) if there's no display.
+    fn observer() -> Option<RustConnection> {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("no DISPLAY: skipping plugin GUI test (run under Xvfb to include it)");
+            return None;
+        }
+        Some(x11rb::connect(None).ok()?.0)
+    }
+
+    fn size_of(x: &RustConnection, w: u32) -> Option<(u32, u32)> {
+        let g = x.get_geometry(w).ok()?.reply().ok()?;
+        Some((g.width as u32, g.height as u32))
+    }
+
+    fn children(x: &RustConnection, w: u32) -> Vec<u32> {
+        x.query_tree(w).ok().and_then(|c| c.reply().ok()).map_or(Vec::new(), |t| t.children)
+    }
+
+    /// Runs UI frames (editor and plugin servicing) until `done`, or 3 s.
+    fn frames(ed: &mut Editor, done: impl Fn(&mut Editor) -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if !ed.service() {
+                return false;
+            }
+            ed.instance().service();
+            if done(ed) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    fn gain() -> (Arc<Instance>, Arc<test_plugin::Records>) {
+        let inst = Instance::create(&example_bundle(), GAIN_ID, &INFO).unwrap();
+        // SAFETY: the plugin is alive.
+        let rec = unsafe { test_plugin::records(inst.raw()) };
+        (inst, rec)
+    }
+
+    #[test]
+    fn an_embedded_gui_lives_in_our_window_and_follows_resizes() {
+        let Some(x) = observer() else { return };
+        let (inst, rec) = gain();
+        let mut ed = Editor::open(inst, "Example Gain", None, false).unwrap();
+        assert!(!ed.is_floating());
+        let host = ed.window_id().unwrap() as u32;
+        let plugin = rec.gui_window.load(Relaxed);
+        assert!(children(&x, host).contains(&plugin), "the plugin's window is a CHILD of ours");
+        assert_eq!(size_of(&x, plugin), Some((400, 300)), "at the plugin's size");
+        assert_eq!(size_of(&x, host), Some((400, 300)), "and ours matches it");
+        let mapped = |w: u32| x.get_window_attributes(w).unwrap().reply().unwrap().map_state != MapState::UNMAPPED;
+        assert!(mapped(host) && mapped(plugin), "both shown");
+        assert!(frames(&mut ed, |_| rec.timer_ticks.load(Relaxed) >= 2), "the plugin's timer runs");
+
+        // The user drags our window smaller than the plugin allows: the
+        // plugin gets its nearest size, and our window snaps to it.
+        x.configure_window(host, &ConfigureWindowAux::new().width(100).height(100)).unwrap();
+        x.flush().unwrap();
+        assert!(frames(&mut ed, |_| size_of(&x, host) == Some((200, 150)) && size_of(&x, plugin) == Some((200, 150))), "snapped to 200x150");
+
+        // The plugin asks for a new size: our window follows.
+        *rec.want_resize.lock().unwrap() = Some((640, 480));
+        assert!(frames(&mut ed, |_| size_of(&x, host) == Some((640, 480)) && size_of(&x, plugin) == Some((640, 480))), "followed the plugin");
+    }
+
+    #[test]
+    fn closing_the_window_destroys_the_gui_first() {
+        let Some(x) = observer() else { return };
+        let (inst, rec) = gain();
+        let mut ed = Editor::open(inst.clone(), "Example Gain", None, false).unwrap();
+        let host = ed.window_id().unwrap() as u32;
+        // What a window manager sends when the close button is clicked.
+        let atom = |n: &[u8]| x.intern_atom(false, n).unwrap().reply().unwrap().atom;
+        let (protocols, delete) = (atom(b"WM_PROTOCOLS"), atom(b"WM_DELETE_WINDOW"));
+        let msg = ClientMessageEvent::new(32, host, protocols, [delete, 0, 0, 0, 0]);
+        x.send_event(false, host, EventMask::NO_EVENT, msg).unwrap();
+        x.flush().unwrap();
+        assert!(!frames(&mut ed, |_| false), "the editor saw the close");
+        drop(ed);
+        assert_eq!(rec.gui_window.load(Relaxed), 0, "the plugin destroyed its GUI");
+        x.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(size_of(&x, host).is_none(), "and then our window was destroyed");
+        let calls = rec.calls.lock().unwrap().clone();
+        let at = |c: &str| calls.iter().position(|x| *x == c).unwrap_or(usize::MAX);
+        assert!(at("gui.create") < at("gui.set_parent") && at("gui.set_parent") < at("gui.show"));
+        assert!(at("gui.hide") < at("gui.destroy"));
+        assert!(rec.violations.lock().unwrap().is_empty(), "{:?}", rec.violations.lock().unwrap());
+        assert!(inst.host_shared().timers.lock().unwrap().is_empty(), "the plugin unregistered its timer");
+    }
+
+    #[test]
+    fn a_floating_gui_stays_in_front_of_the_main_window() {
+        let Some(x) = observer() else { return };
+        // A stand-in for the DAW's main window.
+        let root = x.setup().roots[0].root;
+        let main = x.generate_id().unwrap();
+        x.create_window(x11rb::COPY_DEPTH_FROM_PARENT, main, root, 0, 0, 800, 600, 0, WindowClass::INPUT_OUTPUT, 0, &CreateWindowAux::new()).unwrap();
+        x.flush().unwrap();
+        let raw = raw_window_handle::RawWindowHandle::Xlib(raw_window_handle::XlibWindowHandle::new(main as _));
+        let parent = ParentWindow::from_raw(raw).unwrap();
+
+        let (inst, rec) = gain();
+        let ed = Editor::open(inst, "Example Gain", Some(parent), true).unwrap();
+        assert!(ed.is_floating() && ed.window_id().is_none(), "the plugin's own window, not ours");
+        let plugin = rec.gui_window.load(Relaxed);
+        let transient = x.get_property(false, plugin, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1).unwrap().reply().unwrap();
+        assert_eq!(transient.value32().and_then(|mut v| v.next()), Some(main), "marked as belonging to the main window");
+        let name = x.get_property(false, plugin, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 64).unwrap().reply().unwrap();
+        assert_eq!(name.value, b"Example Gain", "titled by the host");
+    }
+
+    #[test]
+    fn plugins_without_a_gui_say_so() {
+        let inst = Instance::create(&example_bundle(), test_plugin::LOOKAHEAD_ID, &INFO).unwrap();
+        let err = Editor::open(inst, "x", None, false).err().unwrap();
+        assert!(err.contains("has no GUI"), "{err}");
+    }
+}

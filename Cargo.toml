@@ -13,6 +13,17 @@ serde = { version = "1", features = ["derive"] }  # project files: structure
 serde_json = "1"  # project files: the JSON format
 clap-sys = "0.5"  # CLAP plugin API: the raw C types and constants
 libloading = "0.8"  # loading plugin libraries at runtime
+raw-window-handle = "0.6"  # the main window's native handle, for plugin windows
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"  # X11 windows for embedded plugin GUIs
+libc = "0.2"  # poll(): plugin GUIs' file descriptors
+
+[features]
+# Reserved for embedded plugin GUIs on macOS (Cocoa) and Windows (Win32),
+# opt-in at first: that code can't be compiled where it's being written.
+# Linux (X11) is always on, and tested. (The feature does nothing yet.)
+embedded-gui = []
 
 [profile.dev]
 opt-level = 1   # unoptimized DSP can be too slow even for testing

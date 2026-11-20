@@ -29,7 +29,19 @@ pub fn run(session: Session) -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]).with_title("daw"),
         ..Default::default()
     };
-    eframe::run_native("daw", options, Box::new(|_cc| Box::new(DawApp::new(session))))
+    eframe::run_native(
+        "daw",
+        options,
+        Box::new(|cc| {
+            // The main window's native handle: floating plugin GUIs are
+            // asked to stay in front of it.
+            use raw_window_handle::HasWindowHandle;
+            let mut session = session;
+            let parent = cc.window_handle().ok().and_then(|h| crate::clap::window::ParentWindow::from_raw(h.as_raw()));
+            session.set_parent_window(parent);
+            Box::new(DawApp::new(session))
+        }),
+    )
 }
 
 pub struct DawApp {
@@ -922,5 +934,30 @@ mod tests {
         let mut after = Harness::new(move |t| t.session.recovery_dir = dir);
         after.frame(vec![]);
         assert!(matches!(after.app.dialog, Some(menu::Dialog::Recover { .. })), "{:?}", after.app.dialog);
+    }
+
+    // ---- Plugin GUIs ----
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_inspector_opens_and_closes_a_plugin_gui() {
+        let Ok(_main_window) = x11rb::connect(None) else {
+            eprintln!("no X display: skipping plugin GUI test (run under Xvfb to include it)");
+            return;
+        };
+        let mut h = Harness::new(|t| {
+            project(t);
+            t.session.register_bundle(crate::clap::tests::example_bundle());
+            t.session.add_plugin(Target::Track(1), std::path::Path::new("example.clap"), crate::clap::test_plugin::GAIN_ID, None).unwrap();
+        });
+        h.app.selected = Target::Track(1);
+        let slot = (0..crate::mixer::MAX_SLOTS).find(|&s| h.app.session.project.tracks[1].as_ref().unwrap().slots[s].as_ref().map_or(false, |n| n.plugin.is_some())).unwrap();
+        let inst = h.app.session.project.tracks[1].as_ref().unwrap().slots[slot].as_ref().unwrap().plugin.as_ref().unwrap().instance.clone().unwrap();
+        assert!(h.app.session.toggle_editor(&inst).unwrap());
+        for _ in 0..5 {
+            h.frame(vec![]); // the open GUI is serviced every frame
+        }
+        assert!(h.app.session.editor_open(&inst), "still open after frames");
+        assert!(!h.app.session.toggle_editor(&inst).unwrap(), "and closes");
     }
 }
