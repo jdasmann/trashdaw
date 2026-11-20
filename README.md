@@ -30,6 +30,13 @@ In the window:
   as a whole. The title bar shows **•** when there are unsaved changes.
 - **Edit** menu: **Undo/Redo** (⌘Z / ⇧⌘Z, or Ctrl+Z / Ctrl+Shift+Z /
   Ctrl+Y), and a History list. A slider drag is one undo step.
+- Projects open in the background, with a progress bar (and Cancel).
+  **Save As** can copy all of a project's audio into its folder, making it
+  self-contained to move or send to someone.
+- **Autosave**: with unsaved changes, a recovery copy is written every two
+  minutes (next to the project, or for an untitled one in the OS's
+  application-data folder). After a crash, it's offered when you start
+  the DAW or open the project. Autosave never touches the real file.
 
 - **+ Track** adds a track. Select it to edit it in the inspector (right).
 - **Drop audio files** onto the window to load them, select one in the
@@ -53,14 +60,17 @@ In the window:
 - **Recording**: arm a track with **●**, then play. The take lands as a
   clip when you stop, and is saved in `recordings/`. With a loop, each lap
   becomes its own take, newest on top. The "Audio input" panel (left)
-  shows the input level, the latency the driver reports, and a manual
-  adjustment for calibrating timing.
+  shows the input level, the output buffer size and its latency, the
+  latency the driver reports, and a manual adjustment for calibrating
+  timing.
 - **Punch in/out**: tick **punch** in the transport bar and set its bars
   (shown in red on the ruler). Play from earlier to hear the lead-in; only
   the punch range is recorded, to the exact sample.
 - **Monitor input** (Audio input panel) plays your input through the armed
   track and its effects. Use headphones: with speakers it can feed back.
-  The panel also measures **clock drift** between input and output.
+  The panel also measures **clock drift** between input and output, and
+  can **correct** it (resampling the input onto the output's clock), for
+  when input and output are different devices.
 
 ## Plugins (CLAP)
 
@@ -76,8 +86,9 @@ inspector's "+ add effect" menu, and instruments in its Instrument menu.
 Their parameters work like built-in ones: sliders, automation, undo, and
 saving (with each plugin's own state).
 
-`plugins/clap-example` contains two tiny example plugins (a gain and a
-beep synth) as their own crate, a known-good plugin to try:
+`plugins/clap-example` contains three tiny example plugins (a gain, a beep
+synth, and a 100-frame look-ahead) as their own crate, known-good plugins
+to try:
 
     cd plugins/clap-example && cargo build --release
 
@@ -85,9 +96,16 @@ then copy the built library into a CLAP folder, renamed `Example.clap`
 (`target/release/libclap_example.so` on Linux, `.dylib` on macOS,
 `clap_example.dll` on Windows).
 
+Plugins are told the tempo, position, loop and bar, so tempo-synced ones
+lock to the song. Plugins that add latency (look-ahead limiters and the
+like) are compensated: other tracks are delayed to match, and the total
+shows in the left panel.
+
 A plugin runs inside the DAW's process: a crashing plugin takes the DAW
 with it, and a slow one causes dropouts. The inspector shows each plugin's
-share of the time budget, and bypasses a plugin that reports an error.
+share of the time budget. A plugin that reports an error is bypassed, and
+a **watchdog** bypasses one that uses over 80% of the time budget for 8
+blocks in a row (re-enable it from the inspector).
 
 ## Testing and benchmarks
 
@@ -97,12 +115,19 @@ share of the time budget, and bypasses a plugin that reports an error.
 The UI tests drive real egui frames with synthetic mouse and keyboard
 input, without opening a window.
 
+Tests and debug builds also check the audio thread's central rule: it must
+never allocate or free memory. A checking allocator counts any allocation
+made during an audio callback; one test drives every feature at once and
+requires zero, and a debug build of the app shows a warning if one ever
+happens (`device` in the command line reports it too).
+
 ## Layout
 
     src/
       main.rs        audio device setup; starts the UI or the command line
       session.rs     every main-thread action, shared by the UI and the CLI
-      session/       undo/redo (snapshots + reconciliation), project files
+      session/       undo/redo, project files (background loading,
+                     collect, autosave), plugins
       cli.rs         the command-line front end
       ui/            the egui front end: timeline, piano roll, mixer,
                      inspector, meters
@@ -118,9 +143,11 @@ input, without opening a window.
       buffer.rs      planar audio buffer
       smoothing.rs   parameter smoothing
       loader.rs      audio file decoding (symphonia)
-      record.rs      recording: latency compensation, WAV writer, disk thread
+      record.rs      recording: latency compensation, WAV writer, disk
+                     thread, clock-drift measurement and correction
       clap/          CLAP plugin hosting: loading, instances, the plugin node
       denormal.rs    flush-to-zero guard for the audio thread
+      rtcheck.rs     the no-allocation check for the audio thread
       bench.rs       offline benchmarks (tests only)
       nodes/         effects: filter, eq, delay, comp, reverb, gain, lp,
                      pan, osc, click

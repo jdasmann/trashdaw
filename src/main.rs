@@ -13,6 +13,7 @@ mod mixer;
 mod nodes;
 mod processor;
 mod record;
+mod rtcheck;
 mod project;
 mod session;
 mod smoothing;
@@ -35,6 +36,12 @@ use session::Session;
 use transport::TransportShared;
 
 const MAX_BLOCK: usize = 512;
+
+/// In tests and debug builds, every allocation is checked against the
+/// audio thread's no-allocation rule (see rtcheck.rs).
+#[cfg(any(test, debug_assertions))]
+#[global_allocator]
+static ALLOCATOR: rtcheck::CheckingAllocator = rtcheck::CheckingAllocator;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `cargo run --release` opens the window; `cargo run --release -- --cli`

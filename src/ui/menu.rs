@@ -19,10 +19,13 @@ pub enum Then {
 pub enum Dialog {
     /// Ask for a path to open.
     Open { path: String },
-    /// Ask for a path to save to, then carry on with `then`.
-    SaveAs { path: String, then: Then },
+    /// Ask for a path to save to, then carry on with `then`. `collect`
+    /// copies all the project's audio into its folder first.
+    SaveAs { path: String, then: Then, collect: bool },
     /// "Save changes before...?"
     Unsaved { then: Then },
+    /// "Recover unsaved work from <time>?"
+    Recover { saved_at: std::time::SystemTime },
 }
 
 impl DawApp {
@@ -42,7 +45,7 @@ impl DawApp {
                     ui.close_menu();
                 }
                 if ui.button("Save As...").clicked() {
-                    self.dialog = Some(Dialog::SaveAs { path: self.suggested_path(), then: Then::Nothing });
+                    self.dialog = Some(Dialog::SaveAs { path: self.suggested_path(), then: Then::Nothing, collect: false });
                     ui.close_menu();
                 }
             });
@@ -121,19 +124,52 @@ impl DawApp {
                     self.carry_on(then);
                 }
             }
-            None => self.dialog = Some(Dialog::SaveAs { path: self.suggested_path(), then }),
+            None => self.dialog = Some(Dialog::SaveAs { path: self.suggested_path(), then, collect: false }),
         }
     }
 
-    pub(super) fn save_as(&mut self, raw: &str, then: Then) {
+    pub(super) fn save_as(&mut self, raw: &str, then: Then, collect: bool) {
         let mut path = crate::session::clean_path(raw);
         if !raw.trim().ends_with(".json") {
             path = PathBuf::from(format!("{}.{PROJECT_EXTENSION}", path.display()));
         }
-        let r = self.session.save_project(&path);
-        if self.report(r).is_some() {
-            self.status = format!("saved {}", path.display());
+        let r = self.session.save_project_with(&path, collect);
+        if let Some(warnings) = self.report(r) {
+            self.status = match (collect, warnings.len()) {
+                (true, 0) => format!("saved {}, with all its audio", path.display()),
+                (true, n) => format!("saved {}; {n} file(s) couldn't be collected: see the log", path.display()),
+                _ => format!("saved {}", path.display()),
+            };
+            self.log.extend(warnings);
             self.carry_on(then);
+        }
+    }
+
+    /// Called every frame: finishes a background load, and autosaves.
+    pub(super) fn tick_project(&mut self) {
+        if let Some(r) = self.session.poll_open() {
+            if let Some(warnings) = self.report(r) {
+                let name = self.session.project_path.as_ref().map_or("project".into(), |p| p.display().to_string());
+                self.status = match warnings.len() {
+                    0 => format!("opened {name}"),
+                    n => format!("opened {name} with {n} warning(s): see the log"),
+                };
+                self.log.extend(warnings);
+                self.forget_view_state();
+                self.offer_recovery();
+            }
+        }
+        if let Some(Err(e)) = self.session.autosave_tick(std::time::Instant::now()) {
+            self.status = format!("autosave failed: {e}");
+        }
+    }
+
+    /// If there's unsaved work from last time (a crash, probably), ask.
+    pub(super) fn offer_recovery(&mut self) {
+        if self.dialog.is_none() {
+            if let Some((_, saved_at)) = self.session.pending_recovery() {
+                self.dialog = Some(Dialog::Recover { saved_at });
+            }
         }
     }
 
@@ -162,14 +198,10 @@ impl DawApp {
                 }
             }
             Then::Open(path) => {
-                let r = self.session.open_project(&path);
-                if let Some(warnings) = self.report(r) {
-                    self.status = match warnings.len() {
-                        0 => format!("opened {}", path.display()),
-                        n => format!("opened {} with {n} warning(s): see the log", path.display()),
-                    };
-                    self.log.extend(warnings);
-                    self.forget_view_state();
+                // In the background: `tick_project` finishes it.
+                let r = self.session.begin_open(&path);
+                if self.report(r).is_some() {
+                    self.status = format!("opening {}...", path.display());
                 }
             }
             Then::Quit => self.quit_now = true,
@@ -185,6 +217,20 @@ impl DawApp {
     }
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
+        // While a project loads: a progress bar, and a way out.
+        if let Some((done, total)) = self.session.load_progress() {
+            let name = self.session.loading_path().and_then(|p| p.file_name()).map_or("project".into(), |n| n.to_string_lossy().into_owned());
+            egui::Window::new("Opening").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label(format!("Loading {name}: {done} of {total} audio files"));
+                ui.add(egui::ProgressBar::new(if total == 0 { 1.0 } else { done as f32 / total as f32 }).show_percentage());
+                if ui.button("Cancel").clicked() {
+                    self.session.cancel_open();
+                    self.status = "opening cancelled".into();
+                }
+            });
+            ctx.request_repaint();
+        }
+
         // The window's close button: catch it if there's work to lose.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_now && self.session.history.unsaved() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -200,6 +246,7 @@ impl DawApp {
             Dialog::Open { .. } => "Open project",
             Dialog::SaveAs { .. } => "Save project as",
             Dialog::Unsaved { .. } => "Unsaved changes",
+            Dialog::Recover { .. } => "Recover unsaved work",
         };
         egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             match &mut dialog {
@@ -218,19 +265,44 @@ impl DawApp {
                         }
                     });
                 }
-                Dialog::SaveAs { path, then } => {
+                Dialog::SaveAs { path, then, collect } => {
                     ui.label("Save to:");
                     let edit = ui.add(egui::TextEdit::singleline(path).desired_width(360.0));
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    ui.checkbox(collect, "Copy all audio into the project's folder")
+                        .on_hover_text("makes the project self-contained, to move or send to someone");
                     ui.weak("Audio inside the project's folder is stored relative to it, so the folder can be moved.");
                     ui.horizontal(|ui| {
                         if (ui.button("Save").clicked() || enter) && !path.trim().is_empty() {
-                            let (p, t) = (path.clone(), then.clone());
+                            let (p, t, c) = (path.clone(), then.clone(), *collect);
                             keep = false;
-                            self.save_as(&p, t);
+                            self.save_as(&p, t, c);
                         }
                         if ui.button("Cancel").clicked() {
                             keep = false;
+                        }
+                    });
+                }
+                Dialog::Recover { saved_at } => {
+                    let ago = saved_at.elapsed().map_or("a while".into(), |d| match d.as_secs() {
+                        s if s < 120 => format!("{s} seconds"),
+                        s if s < 7_200 => format!("{} minutes", s / 60),
+                        s => format!("{} hours", s / 3_600),
+                    });
+                    ui.label(format!("There's unsaved work from {ago} ago, most likely from a crash."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Recover it").clicked() {
+                            keep = false;
+                            let r = self.session.restore_recovery();
+                            if let Some(warnings) = self.report(r) {
+                                self.status = "recovered: save to keep it".into();
+                                self.log.extend(warnings);
+                                self.forget_view_state();
+                            }
+                        }
+                        if ui.button("Discard it").clicked() {
+                            keep = false;
+                            self.session.discard_recovery();
                         }
                     });
                 }
@@ -250,6 +322,8 @@ impl DawApp {
                         if ui.button("Don't save").clicked() {
                             let t = then.clone();
                             keep = false;
+                            // A deliberate "no": the recovery copy goes too.
+                            self.session.discard_recovery();
                             self.carry_on(t);
                         }
                         if ui.button("Cancel").clicked() {

@@ -49,6 +49,7 @@ pub struct DawApp {
     input_meter: meter::MeterState,
     punch_bars: (f64, f64),
     dialog: Option<menu::Dialog>,
+    checked_recovery: bool,
     /// Displayed CPU share per plugin instance (by address), decayed.
     plugin_cpu: std::collections::HashMap<usize, f32>,
     /// Set once the user has chosen to quit (after any saving).
@@ -73,6 +74,7 @@ impl DawApp {
             input_meter: meter::MeterState::default(),
             punch_bars: (3.0, 5.0),
             dialog: None,
+            checked_recovery: false,
             plugin_cpu: std::collections::HashMap::new(),
             quit_now: false,
             title: String::new(),
@@ -98,19 +100,49 @@ impl DawApp {
             self.status = msg.clone();
             self.log.push(msg);
         }
-        self.handle_input(ctx);
-        self.shortcuts(ctx);
+        self.tick_project();
+        if !self.checked_recovery {
+            self.checked_recovery = true;
+            self.offer_recovery(); // unsaved work from last time?
+        }
+        // While a project loads, nothing can be edited: the loaded project
+        // is about to replace this one (the session refuses edits too).
+        let enabled = self.session.load_progress().is_none();
+        if enabled {
+            self.handle_input(ctx);
+            self.shortcuts(ctx);
+        }
         self.update_title(ctx);
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_ui(ui));
-        egui::TopBottomPanel::top("transport").show(ctx, |ui| self.transport_ui(ui));
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| ui.label(&self.status));
-        egui::TopBottomPanel::bottom("mixer").resizable(true).default_height(270.0).show(ctx, |ui| self.mixer_ui(ui));
-        egui::SidePanel::left("library").resizable(true).default_width(210.0).show(ctx, |ui| self.library_ui(ui));
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            ui.set_enabled(enabled);
+            self.menu_ui(ui)
+        });
+        egui::TopBottomPanel::top("transport").show(ctx, |ui| {
+            ui.set_enabled(enabled);
+            self.transport_ui(ui)
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            let violations = self.session.shared.rt_violations();
+            if violations > 0 {
+                ui.colored_label(egui::Color32::from_rgb(230, 60, 50), format!("debug check: the audio thread allocated memory {violations} time(s), a real-time bug"));
+            }
+            ui.label(&self.status)
+        });
+        egui::TopBottomPanel::bottom("mixer").resizable(true).default_height(270.0).show(ctx, |ui| {
+            ui.set_enabled(enabled);
+            self.mixer_ui(ui)
+        });
+        egui::SidePanel::left("library").resizable(true).default_width(210.0).show(ctx, |ui| {
+            ui.set_enabled(enabled);
+            self.library_ui(ui)
+        });
         egui::SidePanel::right("inspector").resizable(true).default_width(300.0).show(ctx, |ui| {
+            ui.set_enabled(enabled);
             egui::ScrollArea::vertical().show(ui, |ui| self.inspector_ui(ui));
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.set_enabled(enabled);
             egui::ScrollArea::vertical().show(ui, |ui| self.timeline_ui(ui));
         });
         self.piano_ui(ctx);
@@ -252,6 +284,11 @@ impl DawApp {
                 self.log.extend(problems);
             }
         });
+        let pdc = self.session.shared.plugin_latency();
+        if pdc > 0 {
+            ui.small(format!("delay compensation: {:.1} ms", pdc as f64 * 1000.0 / self.session.sample_rate))
+                .on_hover_text("plugins with latency delay the whole mix by this much, so everything stays in time");
+        }
         if self.session.plugins.is_empty() {
             ui.weak("None found yet.");
         }
@@ -299,6 +336,12 @@ impl DawApp {
     /// The audio input: level, latency, and the manual adjustment.
     fn input_ui(&mut self, ui: &mut egui::Ui) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Step 1's exercise: the buffer size, and the latency it sets.
+        let frames = self.session.shared.callback_frames();
+        if frames > 0 {
+            ui.small(format!("output buffer: {frames} frames = {:.1} ms", frames as f64 * 1000.0 / self.session.sample_rate))
+                .on_hover_text("the audio device asks for this much at a time; smaller means less latency but more risk of dropouts");
+        }
         ui.strong("Audio input");
         let Some(r) = self.session.recorder() else {
             ui.weak("No input device: recording is unavailable.");
@@ -346,6 +389,15 @@ impl DawApp {
         if ui.checkbox(&mut monitor, "monitor input").on_hover_text(tip).changed() {
             let r = self.session.set_monitor(monitor);
             self.report(r);
+        }
+        let mut correct = self.session.drift_correction;
+        let tip = "resample the input onto the output's clock, so long takes keep time with the song. Needed when the input and output are different devices";
+        if ui.checkbox(&mut correct, "correct clock drift").on_hover_text(tip).changed() {
+            let r = self.session.set_drift_correction(correct);
+            self.report(r);
+        }
+        if let Some(ppm) = self.session.correction_ppm() {
+            ui.small(format!("correcting {ppm:+.1} ppm"));
         }
         ui.horizontal(|ui| {
             match self.session.drift_ppm() {
@@ -757,7 +809,7 @@ mod tests {
         let mut h = Harness::new(project);
         h.frame(vec![]);
         assert!(h.app.title.ends_with("untitled •"), "{}", h.app.title);
-        h.app.save_as(&dir.join("song").display().to_string(), menu::Then::Nothing);
+        h.app.save_as(&dir.join("song").display().to_string(), menu::Then::Nothing, false);
         h.frame(vec![]);
         assert_eq!(h.app.title, "daw - song.daw.json", "saved: no dot, and the extension added");
         h.app.session.set_mute(0, true).unwrap();
@@ -814,6 +866,7 @@ mod tests {
             let path = std::path::Path::new("example.clap");
             t.session.add_plugin(Target::Track(1), path, GAIN_ID, None).unwrap();
             t.session.set_plugin_instrument(1, path, BEEP_ID).unwrap();
+            t.session.add_plugin(Target::Track(1), path, crate::clap::test_plugin::LOOKAHEAD_ID, None).unwrap();
             // And a placeholder for a plugin that couldn't be found.
             let mut missing = crate::project::NodeInfo::new(crate::clap::intern("org.gone.reverb (missing)"), &[]);
             missing.plugin = Some(crate::project::PluginInfo { path: "/nowhere/Gone.clap".into(), id: "org.gone.reverb".into(), instance: None, state: None });
@@ -823,6 +876,51 @@ mod tests {
         for _ in 0..3 {
             h.frame(vec![]);
         }
-        assert_eq!(h.app.plugin_cpu.len(), 2, "both live plugins show their load");
+        assert_eq!(h.app.plugin_cpu.len(), 3, "every live plugin shows its load");
+    }
+
+    // ---- Step 11 exercises, in the UI ----
+
+    #[test]
+    fn opening_shows_progress_and_locks_editing() {
+        let dir = std::env::temp_dir().join("daw_ui_bg_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = Harness::new(project);
+        a.app.save_as(&dir.join("song").display().to_string(), menu::Then::Nothing, false);
+
+        let mut h = Harness::new(|t| {
+            t.session.add_track(Some("old".into())).unwrap();
+        });
+        h.frame(vec![]);
+        h.app.carry_on(menu::Then::Open(dir.join("song.daw.json")));
+        assert!(h.app.session.load_progress().is_some(), "loading in the background");
+        assert!(h.app.session.set_mute(0, true).is_err(), "no edits meanwhile");
+        for _ in 0..500 {
+            h.frame(vec![]);
+            if h.app.session.load_progress().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(h.app.status.starts_with("opened"), "{}", h.app.status);
+        assert_eq!(h.app.session.project.tracks[0].as_ref().unwrap().name, "Drums", "replaced by the loaded project");
+    }
+
+    #[test]
+    fn unsaved_work_from_a_crash_is_offered_at_startup() {
+        let recovery = std::env::temp_dir().join("daw_ui_recovery_dir");
+        let _ = std::fs::remove_dir_all(&recovery);
+        // A session that autosaved, then "crashed".
+        let mut before = Harness::new(project);
+        before.app.session.recovery_dir = recovery.clone();
+        before.app.session.autosave_every = std::time::Duration::ZERO;
+        before.frame(vec![]); // the frame's tick autosaves
+        assert!(recovery.join("untitled.recovery.daw.json").exists());
+
+        let dir = recovery.clone();
+        let mut after = Harness::new(move |t| t.session.recovery_dir = dir);
+        after.frame(vec![]);
+        assert!(matches!(after.app.dialog, Some(menu::Dialog::Recover { .. })), "{:?}", after.app.dialog);
     }
 }

@@ -50,6 +50,8 @@ pub struct RecordShared {
     /// the output. Their difference grows steadily if the clocks differ.
     pub frames_in: AtomicU64,
     pub frames_out: AtomicU64,
+    /// The drift correction being applied, in thousandths of a ppm.
+    pub correction_ppm: std::sync::atomic::AtomicI64,
 }
 
 impl RecordShared {
@@ -62,6 +64,7 @@ impl RecordShared {
             input_latency: AtomicU32::new(0),
             frames_in: AtomicU64::new(0),
             frames_out: AtomicU64::new(0),
+            correction_ppm: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -139,6 +142,127 @@ impl DriftEstimator {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+/// Step 10 exercise: drift CORRECTION, by adaptive resampling.
+///
+/// Input frames go into a small buffer; out come exactly as many frames as
+/// the output renders, read at a fractional position that advances by
+/// `ratio` (close to 1) per frame, with 4-point cubic interpolation. A PI
+/// controller steers the ratio to keep the buffer at a target fill: if it
+/// keeps filling up, the input clock is fast, so read a little faster. The
+/// integral term is what finds the true clock ratio; on its own, the
+/// proportional term would always settle with some error left.
+///
+/// The gains are deliberately gentle. Input arrives in whole device
+/// buffers, so at a realistic 20 ppm an extra buffer's worth turns up only
+/// every few minutes: the fill level is a coarse sawtooth, and a fast
+/// controller would chase it, wobbling the pitch. Slow and steady settles
+/// in minutes and then holds (clock drift barely changes). Simulated, it
+/// keeps 5-100 ppm of drift with under 50 ppm of wobble, well under a
+/// tenth of a cent.
+pub struct DriftCorrector {
+    l: Vec<f32>,
+    r: Vec<f32>,
+    mask: usize,
+    read: usize,
+    len: usize,
+    /// Fractional read position, in frames past `read`.
+    pos: f64,
+    ratio: f64,
+    integral: f64,
+    smoothed_error: f64,
+    primed: bool,
+    pub underruns: u32,
+}
+
+const KP: f64 = 1e-7;
+const KI: f64 = 1e-11;
+const SMOOTHING: f64 = 0.001;
+/// No real pair of crystal clocks differs by more than this.
+pub const MAX_CORRECTION: f64 = 1e-3;
+
+impl DriftCorrector {
+    /// Main thread: all the memory it will ever use.
+    pub fn new(capacity: usize) -> Self {
+        let n = capacity.next_power_of_two();
+        Self { l: vec![0.0; n], r: vec![0.0; n], mask: n - 1, read: 0, len: 0, pos: 1.0, ratio: 1.0, integral: 0.0, smoothed_error: 0.0, primed: false, underruns: 0 }
+    }
+
+    /// The current correction, in parts per million.
+    pub fn ppm(&self) -> f64 {
+        (self.ratio - 1.0) * 1e6
+    }
+
+    /// How long ago (in frames) the next output frame was captured: the
+    /// latency this buffer adds.
+    pub fn latency_frames(&self) -> usize {
+        (self.len as f64 - self.pos).max(0.0) as usize
+    }
+
+    pub fn push(&mut self, l: &[f32], r: &[f32]) {
+        let cap = self.l.len();
+        for (&a, &b) in l.iter().zip(r) {
+            if self.len == cap {
+                self.read = (self.read + 1) & self.mask; // full: drop the oldest
+                self.len -= 1;
+            }
+            let at = (self.read + self.len) & self.mask;
+            self.l[at] = a;
+            self.r[at] = b;
+            self.len += 1;
+        }
+    }
+
+    /// Produces exactly `out_l.len()` frames, resampled to the output clock.
+    pub fn pull(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+        let n = out_l.len();
+        // Two callbacks of headroom (plus room for one input burst).
+        let target = (2 * n + 512) as f64;
+        if !self.primed {
+            if (self.len as f64) < target {
+                out_l.fill(0.0);
+                out_r.fill(0.0);
+                return;
+            }
+            self.primed = true;
+            self.pos = 1.0;
+        }
+        let error = self.len as f64 - target;
+        self.smoothed_error += SMOOTHING * (error - self.smoothed_error);
+        self.integral = (self.integral + self.smoothed_error).clamp(-1e9, 1e9);
+        self.ratio = (1.0 + KP * self.smoothed_error + KI * self.integral).clamp(1.0 - MAX_CORRECTION, 1.0 + MAX_CORRECTION);
+
+        let at = |k: usize| (self.read + k) & self.mask;
+        for i in 0..n {
+            let k = self.pos as usize;
+            if k + 2 >= self.len {
+                // Ran dry: silence, and prime again.
+                out_l[i..].fill(0.0);
+                out_r[i..].fill(0.0);
+                self.primed = false;
+                self.underruns += 1;
+                break;
+            }
+            let t = (self.pos - k as f64) as f32;
+            let (a, b, c, d) = (at(k - 1), at(k), at(k + 1), at(k + 2));
+            out_l[i] = cubic(self.l[a], self.l[b], self.l[c], self.l[d], t);
+            out_r[i] = cubic(self.r[a], self.r[b], self.r[c], self.r[d], t);
+            self.pos += self.ratio;
+        }
+        // Drop what's been read, keeping one frame before the position for
+        // the interpolation.
+        let drop = (self.pos as usize).saturating_sub(1).min(self.len);
+        self.read = (self.read + drop) & self.mask;
+        self.len -= drop;
+        self.pos -= drop as f64;
+    }
+}
+
+/// Catmull-Rom interpolation between p1 and p2 (t in 0..1). Unlike linear
+/// interpolation, it keeps high frequencies nearly intact.
+fn cubic(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (3.0 * (p1 - p2) + p3 - p0) * t * t * t)
 }
 
 /// What the disk writer hands to the main thread when a take ends.
@@ -365,5 +489,53 @@ mod tests {
         est.add(512, 512);
         est.add(1024, 1024);
         assert_eq!(est.ppm(48_000.0), None, "too short to say");
+    }
+
+    /// The input device: `drift_ppm` faster than the output, delivering in
+    /// 256-frame bursts. Returns (correction in ppm over the last half,
+    /// fill min, fill max, underruns after priming).
+    fn run_corrector(drift_ppm: f64, callbacks: usize) -> (f64, usize, usize, u32) {
+        let mut c = DriftCorrector::new(65_536);
+        let (mut produced, mut delivered) = (0.0f64, 0usize);
+        let (mut out_l, mut out_r) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+        let (mut ppm_sum, mut ppm_n, mut lo, mut hi) = (0.0, 0, usize::MAX, 0);
+        let mut primed_underruns = 0;
+        for k in 0..callbacks {
+            produced += 512.0 * (1.0 + drift_ppm * 1e-6);
+            let burst = (produced as usize - delivered) / 256 * 256;
+            let frames: Vec<f32> = (delivered..delivered + burst).map(|i| (i as f32 * 0.001).sin()).collect();
+            c.push(&frames, &frames);
+            delivered += burst;
+            let before = c.underruns;
+            c.pull(&mut out_l, &mut out_r);
+            if k > 100 {
+                primed_underruns += c.underruns - before;
+            }
+            if k >= callbacks / 2 {
+                ppm_sum += c.ppm();
+                ppm_n += 1;
+                lo = lo.min(c.len);
+                hi = hi.max(c.len);
+            }
+        }
+        (ppm_sum / ppm_n as f64, lo, hi, primed_underruns)
+    }
+
+    #[test]
+    fn drift_correction_finds_the_clock_ratio_and_holds_the_buffer_steady() {
+        // ~45 simulated minutes each: the controller is gentle on purpose.
+        for drift in [100.0, 20.0, -50.0] {
+            let (ppm, lo, hi, underruns) = run_corrector(drift, 250_000);
+            assert!((ppm - drift).abs() < 0.15 * drift.abs() + 2.0, "drift {drift}: corrected {ppm:.1} ppm");
+            assert_eq!(underruns, 0, "drift {drift}: ran dry");
+            assert!(hi < 4_000 && lo > 0, "drift {drift}: buffer {lo}..{hi} wandered");
+        }
+    }
+
+    #[test]
+    fn cubic_interpolation_is_exact_at_the_samples_and_smooth_between() {
+        assert_eq!(cubic(1.0, 2.0, 3.0, 4.0, 0.0), 2.0);
+        assert_eq!(cubic(1.0, 2.0, 3.0, 4.0, 1.0), 3.0);
+        assert!((cubic(1.0, 2.0, 3.0, 4.0, 0.5) - 2.5).abs() < 1e-6, "a straight line stays straight");
     }
 }

@@ -27,7 +27,9 @@ fn peak_db(peak: f32) -> String {
 }
 
 pub fn print_help() {
-    println!("Project:   save [path] | open <path> | new | undo | redo | history");
+    println!("Project:   save [path] | open <path> | new | undo | redo | history | device");
+    println!("           collect [path]   (save, copying all audio into the project's folder)");
+    println!("           recover | discard   (unsaved work autosaved before a crash)");
     println!("Tracks:    track add [name] | track rm <t> | ls");
     println!("Mixer:     vol <t|a|m> <db> | pan <t> <-1..1> | mute <t> | solo <t> | send <t> <db> | meters");
     println!("           sidechain <t> <source t> | sidechain <t> off   (a comp on <t> then listens to the source)");
@@ -36,6 +38,7 @@ pub fn print_help() {
     println!("           kinds: {}", kinds.join(" "));
     println!("           filter types: 0 lowpass 1 highpass 2 bandpass 3 notch 4 peak 5 low-shelf 6 high-shelf");
     println!("Plugins:   plugins scan | plugins | plugin <t|a|m> <n> | instrument <t> <n>   (CLAP; n from `plugins`)");
+    println!("           reenable <t|a|m> <slot>   (a plugin the watchdog bypassed for being too slow)");
     println!("Samples:   load <path> | samples");
     println!("Clips:     clip add <t> <sample#> <bar> | clip rm <t> <id>");
     println!("           clip mv <t> <id> <bar> | clip len <t> <id> <beats> | clip off <t> <id> <secs>");
@@ -48,6 +51,7 @@ pub fn print_help() {
     println!("           (pitches: 60 or C4, F#3, Bb2; note beats are relative to the clip)");
     println!("Record:    rec <t> | rec off | input | latency <ms> | monitor <on|off>");
     println!("           punch <start_bar> <end_bar> | punch off   (record only inside the range)");
+    println!("           drift <on|off>   (resample the input onto the output's clock)");
     println!("           (armed tracks record while playing; with a loop, each lap is a new take)");
     println!("Transport: play | stop | seek <bar> | tempo <bpm> | loop <start_bar> <end_bar> | loop off | pos");
     println!("           return <on|off> | help | q");
@@ -57,11 +61,15 @@ pub fn print_help() {
 /// Runs the command loop until `q` or end of input.
 pub fn run(session: &mut Session) -> io::Result<()> {
     print_help();
+    announce_recovery(session);
     let mut quit_warned = false;
     for line in io::stdin().lock().lines() {
         session.collect_garbage();
         for msg in session.poll_recordings() {
             println!("{msg}");
+        }
+        if let Some(Err(e)) = session.autosave_tick(std::time::Instant::now()) {
+            println!("autosave failed: {e}");
         }
         let line = line?;
         if line.trim() == "q" {
@@ -69,6 +77,9 @@ pub fn run(session: &mut Session) -> io::Result<()> {
                 println!("unsaved changes: `save <path>` first, or type q again to quit without saving");
                 quit_warned = true;
                 continue;
+            }
+            if session.history.unsaved() {
+                session.discard_recovery(); // a deliberate "quit without saving"
             }
             break;
         }
@@ -78,6 +89,13 @@ pub fn run(session: &mut Session) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn announce_recovery(s: &Session) {
+    if let Some((path, _)) = s.pending_recovery() {
+        println!("there's unsaved work from before (most likely a crash): {}", path.display());
+        println!("  type `recover` to restore it, or `discard` to throw it away");
+    }
 }
 
 fn track_arg(session: &Session, s: &str) -> Result<usize> {
@@ -127,26 +145,56 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
             }
         }
         ["new"] => s.new_project()?,
+        ["recover"] => {
+            for w in s.restore_recovery()? {
+                println!("  warning: {w}");
+            }
+            println!("recovered: `save` to keep it");
+        }
+        ["discard"] => {
+            s.discard_recovery();
+            println!("discarded");
+        }
+        ["device"] => {
+            let ms = |f: u64| f as f64 * 1000.0 / s.sample_rate;
+            let frames = s.shared.callback_frames();
+            println!("  output buffer: {frames} frames = {:.1} ms (the device asks for this much at a time)", ms(frames));
+            println!("  plugin delay compensation: {:.1} ms", ms(s.shared.plugin_latency()));
+            match s.shared.rt_violations() {
+                0 => println!("  real-time check: no allocations on the audio thread"),
+                n => println!("  real-time check: the audio thread allocated memory {n} time(s): a bug"),
+            }
+        }
+        ["collect"] => {
+            let path = s.project_path.clone().ok_or("no file yet: collect <path>")?;
+            for w in s.save_project_with(&path, true)? {
+                println!("  warning: {w}");
+            }
+            println!("saved {} with all its audio", path.display());
+        }
         ["save"] => {
             let path = s.project_path.clone().ok_or("no file yet: save <path>")?;
             s.save_project(&path)?;
             println!("saved {}", path.display());
         }
-        ["save", ..] | ["open", ..] => {
+        ["save", ..] | ["open", ..] | ["collect", ..] => {
             // Paths may contain spaces: take the rest of the line.
             let raw = line.trim_start()[args[0].len()..].trim();
             let mut path = clean_path(raw);
-            if args[0] == "save" {
+            if args[0] != "open" {
                 if !raw.ends_with(".json") {
                     path = PathBuf::from(format!("{}.{}", path.display(), crate::session::PROJECT_EXTENSION));
                 }
-                s.save_project(&path)?;
+                for w in s.save_project_with(&path, args[0] == "collect")? {
+                    println!("  warning: {w}");
+                }
                 println!("saved {}", path.display());
             } else {
                 for w in s.open_project(&path)? {
                     println!("  warning: {w}");
                 }
                 println!("opened {}", path.display());
+                announce_recovery(s);
             }
         }
 
@@ -303,6 +351,14 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
             let slot = s.add_plugin(target, &entry.path, &entry.descriptor.id, None)?;
             println!("added {} at slot {slot}", entry.descriptor.name);
         }
+        ["reenable", t, slot] => {
+            let target = target_arg(s, t)?;
+            let slot: usize = num(slot, "slot")?;
+            let node = s.project.get(target).and_then(|t| t.slots.get(slot)).and_then(|n| n.as_ref()).ok_or("that slot is empty")?;
+            let inst = node.plugin.as_ref().and_then(|p| p.instance.clone()).ok_or("that's not a (loaded) plugin")?;
+            inst.reenable();
+            println!("{} re-enabled", inst.name);
+        }
         ["instrument", t, n] => {
             let track = track_arg(s, t)?;
             let entry = plugin_arg(s, n)?;
@@ -318,6 +374,8 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
             println!("track {track} armed: it records whenever you play");
         }
         ["latency", ms] => s.set_latency_adjust(num(ms, "milliseconds")?)?,
+        ["drift", "on"] => s.set_drift_correction(true)?,
+        ["drift", "off"] => s.set_drift_correction(false)?,
         ["monitor", "on"] => s.set_monitor(true)?,
         ["monitor", "off"] => s.set_monitor(false)?,
         ["punch", "off"] => s.set_punch(None)?,
@@ -343,9 +401,14 @@ pub fn execute(session: &mut Session, line: &str) -> Result {
                     s.latency_adjust_ms
                 );
                 println!("  armed: {}   monitoring: {}", s.rec_track.map_or("none".into(), |t| format!("track {t}")), if s.monitor { "on" } else { "off" });
+                println!("  plugin delay compensation: {:.1} ms (included in take placement)", ms(s.shared.plugin_latency() as u32));
                 match s.drift_ppm() {
                     Some(ppm) => println!("  clock drift: {ppm:+.1} ppm over {:.0} s", s.drift.span_frames() / s.sample_rate),
                     None => println!("  clock drift: measuring (needs ~10 s of running time)"),
+                }
+                match s.correction_ppm() {
+                    Some(ppm) => println!("  drift correction: on, correcting {ppm:+.1} ppm"),
+                    None => println!("  drift correction: off (`drift on` to resample the input onto the output's clock)"),
                 }
                 let dropped = r.shared.dropped.load(Relaxed);
                 if dropped > 0 {
@@ -450,7 +513,14 @@ fn list(s: &Session) {
         for (i, slot) in t.slots.iter().enumerate() {
             if let Some(node) = slot {
                 let params: Vec<String> = node.params.iter().zip(&node.values).map(|(p, v)| format!("{}={v}", p.name)).collect();
-                println!("    {i}: {}  [{}]", node.name, params.join(", "));
+                let status = match node.plugin.as_ref().map(|p| p.instance.as_ref()) {
+                    Some(None) => " (CLAP, missing)".to_string(),
+                    Some(Some(i)) if i.is_overloaded() => " (CLAP, bypassed: too slow; `reenable` it)".to_string(),
+                    Some(Some(i)) if i.latency > 0 => format!(" (CLAP, latency {} frames)", i.latency),
+                    Some(Some(_)) => " (CLAP)".to_string(),
+                    None => String::new(),
+                };
+                println!("    {i}: {}{status}  [{}]", node.name, params.join(", "));
             }
         }
     }

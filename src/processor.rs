@@ -85,6 +85,12 @@ pub trait Processor: Send {
     /// freed on the main thread). Plugins must stop processing on the
     /// audio thread; built-in nodes have nothing to do.
     fn stop(&mut self) {}
+
+    /// How many frames late this node's output is. Built-in effects have
+    /// none; some plugins do (look-ahead). The mixer compensates for it.
+    fn latency(&self) -> u32 {
+        0
+    }
 }
 
 /// A sound source driven by MIDI. Separate from `Processor` because it
@@ -103,4 +109,9 @@ pub trait Instrument: Send {
 
     /// Audio thread, just before the instrument leaves the engine.
     fn stop(&mut self) {}
+
+    /// How many frames late the instrument's output is.
+    fn latency(&self) -> u32 {
+        0
+    }
 }

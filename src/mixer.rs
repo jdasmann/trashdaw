@@ -45,6 +45,59 @@ fn db_to_gain(db: f32) -> f32 {
     if db <= -60.0 { 0.0 } else { db_to_linear(db) }
 }
 
+/// Plugin delay compensation for one track: a delay line on the track's
+/// output (after its effects), read at two points. Every track is delayed
+/// so that all of them line up with the track whose plugins add the most
+/// latency. The aux send is read EARLIER than the direct path, by the aux
+/// bus's own plugin latency: what's sent comes back through the aux that
+/// much later, and then lines up with the (delayed) direct signals.
+pub struct CompDelay {
+    l: Vec<f32>,
+    r: Vec<f32>,
+    mask: usize,
+    write: usize,
+    /// Delays in frames, for the send and for the direct path.
+    send: usize,
+    direct: usize,
+    max: usize,
+    out: [Vec<f32>; 4], // direct l, direct r, send l, send r
+}
+
+impl CompDelay {
+    /// Main thread: allocates room for up to `max_delay` frames of delay.
+    fn new(max_delay: usize, max_frames: usize) -> Self {
+        let len = (max_delay + max_frames).next_power_of_two();
+        Self { l: vec![0.0; len], r: vec![0.0; len], mask: len - 1, write: 0, send: 0, direct: 0, max: max_delay, out: std::array::from_fn(|_| vec![0.0; max_frames]) }
+    }
+
+    pub fn active(&self) -> bool {
+        self.send > 0 || self.direct > 0
+    }
+
+    /// Writes this window's audio, then reads both delayed taps.
+    fn process(&mut self, in_l: &[f32], in_r: &[f32]) {
+        let start = self.write;
+        for (i, (&a, &b)) in in_l.iter().zip(in_r).enumerate() {
+            let at = (start + i) & self.mask;
+            self.l[at] = a;
+            self.r[at] = b;
+        }
+        self.write = (start + in_l.len()) & self.mask;
+        if !self.active() {
+            return;
+        }
+        let n = in_l.len();
+        for (k, delay) in [self.direct, self.send].into_iter().enumerate() {
+            for i in 0..n {
+                // A delay of 0 reads the sample just written.
+                let at = (start + i).wrapping_sub(delay) & self.mask;
+                self.out[2 * k][i] = self.l[at];
+                self.out[2 * k + 1][i] = self.r[at];
+            }
+        }
+    }
+}
+
 /// A channel strip: clips and an instrument, then an effect chain, then volume, balance, mute, solo,
 /// and a send to the aux bus. The aux and master buses are `Track`s too;
 /// they just ignore pan/mute/solo/send.
@@ -69,6 +122,12 @@ pub struct Track {
     send: Smoothed,
     pub mute: bool,
     pub solo: bool,
+    comp: CompDelay,
+}
+
+/// The most plugin delay compensation a track can apply: one second.
+pub fn max_compensation(sample_rate: f32) -> usize {
+    sample_rate as usize
 }
 
 impl Track {
@@ -98,7 +157,24 @@ impl Track {
             send,
             mute: false,
             solo: false,
+            comp: CompDelay::new(max_compensation(info.sample_rate), info.max_frames),
         }
+    }
+
+    /// The latency of everything on this track: its instrument plus every
+    /// effect in its chain (they're in series, so latencies add up).
+    pub fn chain_latency(&self) -> usize {
+        let effects: u32 = self.slots.iter().flatten().map(|n| n.latency()).sum();
+        (effects + self.instrument.as_ref().map_or(0, |i| i.latency())) as usize
+    }
+
+    /// Sets this track's compensation (see `CompDelay`). Returns false if
+    /// it had to be clamped to the maximum.
+    pub fn set_compensation(&mut self, send: usize, direct: usize) -> bool {
+        let max = self.comp.max;
+        self.comp.send = send.min(max);
+        self.comp.direct = direct.min(max);
+        send <= max && direct <= max
     }
 
     pub fn slot_mut(&mut self, slot: usize) -> &mut Option<Box<dyn Processor>> {
@@ -262,10 +338,19 @@ impl Track {
         let audible = !self.mute && (!any_solo || self.solo);
         self.audible.set(if audible { 1.0 } else { 0.0 });
 
+        // Plugin delay compensation. The delay line always gets the audio
+        // (cheap), so turning compensation on doesn't start from silence.
+        {
+            let (l, r) = self.buffer.stereo();
+            self.comp.process(l, r);
+        }
+        let compensated = self.comp.active();
+
         // Exercise 3: if nothing can come out, skip the per-sample fader
         // loop. The smoothers still have to move as if time passed, or a
-        // volume ramp would freeze while the track is silent.
-        if pre == 0.0 || self.audible.is_at(0.0) {
+        // volume ramp would freeze while the track is silent. (A silent
+        // block with compensation can still have delayed audio to play.)
+        if (pre == 0.0 && !compensated) || self.audible.is_at(0.0) {
             self.volume.skip(n);
             self.pan.skip(n);
             self.audible.skip(n);
@@ -273,7 +358,21 @@ impl Track {
             return TrackPeaks { pre, post: 0.0 };
         }
 
-        let (src_l, src_r) = self.buffer.stereo();
+        // What goes to the master (direct) and to the aux (send): the track
+        // itself, or its compensated taps.
+        let (dir_l, dir_r, snd_l, snd_r): (&[f32], &[f32], &[f32], &[f32]) = if compensated {
+            let [a, b, c, d] = &self.comp.out;
+            (&a[..n], &b[..n], &c[..n], &d[..n])
+        } else {
+            let (l, r) = self.buffer.stereo();
+            (l, r, l, r)
+        };
+        let (pre_l, pre_r) = if compensated {
+            let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, &s| peak_with(m, s));
+            (peak(dir_l), peak(dir_r))
+        } else {
+            (pre_l, pre_r)
+        };
         let (master_l, master_r) = master.stereo_mut();
         let (aux_l, aux_r) = aux.stereo_mut();
 
@@ -289,13 +388,11 @@ impl Track {
             let (gl, gr) = (gain * bal_l, gain * bal_r);
             let send = self.send.value();
             for i in 0..n {
-                let left = src_l[i] * gl;
-                let right = src_r[i] * gr;
-                master_l[i] += left;
-                master_r[i] += right;
+                master_l[i] += dir_l[i] * gl;
+                master_r[i] += dir_r[i] * gr;
                 // Post-fader send: the copy follows volume, balance and mute.
-                aux_l[i] += left * send;
-                aux_r[i] += right * send;
+                aux_l[i] += snd_l[i] * gl * send;
+                aux_r[i] += snd_r[i] * gr * send;
             }
             // Scaling by a positive constant scales the peak by the same
             // constant, so the post-fader peak needs no second pass.
@@ -314,12 +411,12 @@ impl Track {
                 balance = balance_gains(self.pan.next());
             }
             let send = self.send.next();
-            let left = src_l[i] * gain * balance.0;
-            let right = src_r[i] * gain * balance.1;
+            let left = dir_l[i] * gain * balance.0;
+            let right = dir_r[i] * gain * balance.1;
             master_l[i] += left;
             master_r[i] += right;
-            aux_l[i] += left * send;
-            aux_r[i] += right * send;
+            aux_l[i] += snd_l[i] * gain * balance.0 * send;
+            aux_r[i] += snd_r[i] * gain * balance.1 * send;
             post = peak_with(peak_with(post, left), right);
         }
         TrackPeaks { pre, post }

@@ -203,6 +203,19 @@ impl DawApp {
             ui.colored_label(egui::Color32::from_rgb(230, 60, 50), "the plugin reported an error: bypassed");
             return;
         }
+        if inst.is_overloaded() {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 60), "bypassed: too slow");
+                if ui.small_button("Re-enable").on_hover_text("if it overloads again, the watchdog will bypass it again").clicked() {
+                    inst.reenable();
+                }
+            });
+            return;
+        }
+        if inst.latency > 0 {
+            let ms = inst.latency as f64 * 1000.0 / self.session.sample_rate;
+            ui.small(format!("latency {} frames ({ms:.1} ms): other tracks are delayed to match", inst.latency));
+        }
         // Peak since last frame, held and decayed so it's readable.
         let key = Arc::as_ptr(inst) as usize;
         let shown = self.plugin_cpu.entry(key).or_insert(0.0);

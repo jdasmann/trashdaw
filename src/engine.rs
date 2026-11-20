@@ -1,7 +1,7 @@
 use crate::buffer::AudioBuffer;
 use crate::automation::AutomationSet;
 use crate::clip::ClipList;
-use crate::record::{take_start, RecEvent, RecordShared, CHUNK};
+use crate::record::{take_start, DriftCorrector, RecEvent, RecordShared, CHUNK};
 use crate::midi::{LiveMidi, MidiMessage, Sequence, SUSTAIN_PEDAL};
 use crate::mixer::{MeterPoint, Meters, Target, Track, MAX_TRACKS, MIX_CHANNELS};
 use crate::processor::{Instrument, PrepareInfo, Processor};
@@ -34,6 +34,9 @@ pub enum Command {
     SetPunch { range: Option<(f64, f64)> },
     /// Hear the input through the armed track.
     SetMonitor { on: bool },
+    /// Resample the input onto the output's clock (None = off). Built on
+    /// the main thread, like everything else that allocates.
+    SetDriftCorrection { corrector: Option<Box<DriftCorrector>> },
     /// Which track's signal `track`'s nodes may listen to (sidechain).
     SetSidechain { track: usize, source: Option<usize> },
     /// The node arrives already constructed and prepared. Moving a Box
@@ -70,6 +73,7 @@ pub enum Garbage {
     Clips(Box<ClipList>),
     Sequence(Box<Sequence>),
     Automation(Box<AutomationSet>),
+    Corrector(Box<DriftCorrector>),
     Instrument(Box<dyn Instrument>),
 }
 
@@ -115,12 +119,20 @@ pub struct Engine {
     take: Option<TakeState>,
     next_take: u32,
     latency_adjust: i64,
+    /// Total plugin delay compensation in frames (see `update_compensation`).
+    plugin_latency: usize,
     /// Punch range in beats: record only inside it.
     punch: Option<(f64, f64)>,
     monitor: bool,
     monitor_fifo: MonitorFifo,
     monitor_l: Vec<f32>,
     monitor_r: Vec<f32>,
+    // Input staging, and drift correction.
+    raw_l: Vec<f32>,
+    raw_r: Vec<f32>,
+    corrector: Option<Box<DriftCorrector>>,
+    corr_l: Vec<f32>,
+    corr_r: Vec<f32>,
 }
 
 /// The input side, wired up only when there's an input device.
@@ -270,11 +282,17 @@ impl Engine {
             take: None,
             next_take: 1,
             latency_adjust: 0,
+            plugin_latency: 0,
             punch: None,
             monitor: false,
             monitor_fifo: MonitorFifo::new(8192),
             monitor_l: vec![0.0; info.max_frames],
             monitor_r: vec![0.0; info.max_frames],
+            raw_l: Vec::new(),
+            raw_r: Vec::new(),
+            corrector: None,
+            corr_l: vec![0.0; 16_384],
+            corr_r: vec![0.0; 16_384],
         }
     }
 
@@ -282,6 +300,10 @@ impl Engine {
     /// capacity a multiple of `channels`), so a frame never straddles the
     /// ring's wrap-around point.
     pub fn set_input(&mut self, samples: Consumer<f32>, channels: usize, recorder: Producer<RecEvent>, shared: Arc<RecordShared>) {
+        // Staging for everything the ring can hold at once.
+        let frames = samples.buffer().capacity() / channels.max(1);
+        self.raw_l = vec![0.0; frames];
+        self.raw_r = vec![0.0; frames];
         self.input = Some(Input { samples, channels: channels.max(1), recorder, shared, left: [0.0; CHUNK], right: [0.0; CHUNK], len: 0 });
     }
 
@@ -304,9 +326,38 @@ impl Engine {
     /// frame, even when a callback straddles the punch point.
     fn capture_input(&mut self, frames: usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(input) = self.input.as_ref() else { return };
+        let Some(input) = self.input.as_mut() else { return };
         let channels = input.channels;
-        let waiting = input.samples.slots() / channels;
+
+        // 1. Everything that has arrived, into the stereo staging buffer.
+        //    (Mono inputs feed both sides; extra channels are ignored.)
+        let raw = (input.samples.slots() / channels).min(self.raw_l.len());
+        if let Ok(chunk) = input.samples.read_chunk(raw * channels) {
+            let (a, b) = chunk.as_slices();
+            for (k, frame) in a.chunks_exact(channels).chain(b.chunks_exact(channels)).enumerate() {
+                self.raw_l[k] = frame[0];
+                self.raw_r[k] = frame[1.min(channels - 1)];
+            }
+            chunk.commit_all();
+        }
+        // For clock-drift measurement: frames received vs frames rendered.
+        input.shared.frames_in.fetch_add(raw as u64, Relaxed);
+        input.shared.frames_out.fetch_add(frames as u64, Relaxed);
+
+        // 2. Those frames as they are, or (with drift correction) exactly
+        //    `frames` frames resampled onto the output's clock.
+        let (count, waiting, corrected) = match self.corrector.as_mut() {
+            None => (raw, raw, false),
+            Some(c) => {
+                c.push(&self.raw_l[..raw], &self.raw_r[..raw]);
+                let waiting = c.latency_frames();
+                let n = frames.min(self.corr_l.len());
+                c.pull(&mut self.corr_l[..n], &mut self.corr_r[..n]);
+                input.shared.correction_ppm.store((c.ppm() * 1_000.0) as i64, Relaxed);
+                (n, waiting, true)
+            }
+        };
+
         let (in_lat, out_lat) = (input.shared.input_latency.load(Relaxed), input.shared.output_latency.load(Relaxed));
         let position = self.transport.position;
         let spb = self.transport.context().samples_per_beat();
@@ -323,19 +374,17 @@ impl Engine {
         // has no gaps or overlaps. A new one starts from the latency math.
         let mut next_pos = match self.take {
             Some(t) => t.next_pos,
-            None => take_start(position, waiting, in_lat, out_lat, self.latency_adjust),
+            // Plugin delay compensation makes everything heard later too.
+            None => take_start(position, waiting, in_lat, out_lat + self.plugin_latency as u32, self.latency_adjust),
         };
         let monitoring = self.monitor && self.rec_track.is_some();
 
-        // Borrow the fields separately: the chunk being read borrows the
-        // input ring while samples go elsewhere.
-        let Input { samples, recorder, shared, left, right, len, .. } = self.input.as_mut().unwrap();
-        let Ok(chunk) = samples.read_chunk(waiting * channels) else { return };
-        let (a, b) = chunk.as_slices();
+        let (src_l, src_r) = if corrected { (&self.corr_l[..count], &self.corr_r[..count]) } else { (&self.raw_l[..count], &self.raw_r[..count]) };
+        // Borrow the fields separately: the source slices borrow the staging
+        // buffers while samples go to the recorder and the monitor.
+        let Input { recorder, shared, left, right, len, .. } = self.input.as_mut().unwrap();
         let mut peak = 0.0f32;
-        for frame in a.chunks_exact(channels).chain(b.chunks_exact(channels)) {
-            // Mono inputs feed both sides; extra channels are ignored.
-            let (l, r) = (frame[0], frame[1.min(channels - 1)]);
+        for (&l, &r) in src_l.iter().zip(src_r) {
             peak = peak.max(l.abs()).max(r.abs());
             if monitoring {
                 self.monitor_fifo.push(l, r);
@@ -374,11 +423,7 @@ impl Engine {
                 }
             }
         }
-        chunk.commit_all();
         shared.record_peak(peak);
-        // For clock-drift measurement: frames received vs frames rendered.
-        shared.frames_in.fetch_add(waiting as u64, Relaxed);
-        shared.frames_out.fetch_add(frames as u64, Relaxed);
         if let Some(t) = self.take.as_mut() {
             t.expected = position + frames as u64;
             t.next_pos = next_pos;
@@ -430,8 +475,31 @@ impl Engine {
         self.target_mut(Target::Track(index))
     }
 
+    /// Plugin delay compensation: delays every track so they all line up
+    /// with the one whose plugins add the most latency. Recomputed whenever
+    /// a chain changes: a few additions per track, no allocation.
+    fn update_compensation(&mut self) {
+        let worst = self.tracks.iter().flatten().map(|t| t.chain_latency()).max().unwrap_or(0);
+        let aux = self.aux.chain_latency();
+        for t in self.tracks.iter_mut().flatten() {
+            let own = t.chain_latency();
+            // Sent signals go through the aux's plugins too, so the send
+            // tap is `aux` frames earlier than the direct one.
+            t.set_compensation(worst - own, worst - own + aux);
+        }
+        // The master's own plugins delay everything equally: no lining up
+        // needed, but it's part of how late everything is heard.
+        self.plugin_latency = worst + aux + self.master.chain_latency();
+        self.shared.set_plugin_latency(self.plugin_latency as u64);
+    }
+
     fn handle_commands(&mut self) {
+        let mut chains_changed = false;
         while let Ok(cmd) = self.commands.pop() {
+            chains_changed |= matches!(
+                cmd,
+                Command::AddTrack { .. } | Command::RemoveTrack { .. } | Command::Insert { .. } | Command::Remove { .. } | Command::SetInstrument { .. }
+            );
             match cmd {
                 Command::AddTrack { index, track } => {
                     if let Some(old) = self.tracks[index].replace(track) {
@@ -505,6 +573,14 @@ impl Engine {
                 Command::SetRecordTrack { track } => self.rec_track = track,
                 Command::SetLatencyAdjust { frames } => self.latency_adjust = frames,
                 Command::SetPunch { range } => self.punch = range,
+                Command::SetDriftCorrection { corrector } => {
+                    if let Some(old) = std::mem::replace(&mut self.corrector, corrector) {
+                        self.retire(Garbage::Corrector(old));
+                    }
+                    if let Some(input) = &self.input {
+                        input.shared.correction_ppm.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 Command::SetMonitor { on } => {
                     self.monitor = on;
                     self.monitor_fifo.clear();
@@ -591,6 +667,9 @@ impl Engine {
                 Command::SetLoop { range } => self.transport.set_loop(range),
             }
         }
+        if chains_changed {
+            self.update_compensation();
+        }
     }
 
     /// Dropping a Box frees memory, which is not real-time safe, so we
@@ -645,6 +724,9 @@ impl Engine {
     where
         T: Sample + FromSample<f32>,
     {
+        // No allocation from here to the end of the callback: checked in
+        // tests and debug builds (see rtcheck.rs).
+        let zone = crate::rtcheck::Zone::enter();
         // Flush denormals to zero for this whole callback (see denormal.rs).
         let _no_denormals = crate::denormal::NoDenormals::new();
         // So plugins asking "am I on the audio thread?" get a true answer.
@@ -767,6 +849,11 @@ impl Engine {
         }
 
         self.shared.publish(&self.transport);
+        self.shared.set_callback_frames((out.len() / dev_ch) as u64);
+        let violations = zone.violations();
+        if violations > 0 {
+            self.shared.add_rt_violations(violations);
+        }
     }
 }
 
@@ -1487,5 +1574,312 @@ mod tests {
         }
         let ppm = est.ppm(48_000.0).unwrap();
         assert!((ppm - 1_000_000.0 / 512.0).abs() < 1.0, "{ppm:.1} ppm");
+    }
+
+    // ---- Step 12 exercise 3: plugin delay compensation ----
+
+    /// A single 0.25 at timeline sample 0, then silence. (Quarter height:
+    /// two of them meeting must not reach the output stage's hard clip.)
+    struct Impulse;
+    impl Processor for Impulse {
+        fn name(&self) -> &'static str { "impulse" }
+        fn param_info(&self) -> &'static [crate::processor::ParamInfo] { &[] }
+        fn prepare(&mut self, _: &PrepareInfo) {}
+        fn set_param(&mut self, _: usize, _: f32) {}
+        fn process(&mut self, b: &mut AudioBuffer, ctx: &ProcessContext) {
+            if ctx.playing && ctx.position == 0 {
+                b.channel_mut(0)[0] += 0.25;
+                b.channel_mut(1)[0] += 0.25;
+            }
+        }
+    }
+
+    fn lookahead() -> Box<dyn Processor> {
+        let inst = crate::clap::Instance::create(&crate::clap::tests::example_bundle(), crate::clap::test_plugin::LOOKAHEAD_ID, &INFO).unwrap();
+        Box::new(crate::clap::ClapNode::new(inst, &INFO).unwrap())
+    }
+
+    /// Plays two blocks and returns where the master's output is nonzero,
+    /// rounded (the center balance gain is 0.99999994 in f32).
+    fn spikes(h: &mut Harness) -> Vec<(usize, f32)> {
+        crate::clap::enter_audio_thread();
+        h.send(Command::Play);
+        let mut all = Vec::new();
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..2 {
+            h.engine.render(&mut out);
+            all.extend(out.chunks(2).map(|f| f[0]));
+        }
+        all.iter().enumerate().filter(|(_, &v)| v.abs() > 1e-6).map(|(i, &v)| (i, (v * 1e4).round() / 1e4)).collect()
+    }
+
+    #[test]
+    fn tracks_are_lined_up_with_the_slowest_one() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.add_track(1);
+        h.insert(0, Box::new(Impulse));
+        h.send(Command::Insert { target: Target::Track(0), slot: 1, node: lookahead() }); // 100 frames late
+        h.insert(1, Box::new(Impulse)); // on time
+        // Without compensation: (0, 0.25) and (100, 0.25). With it, together.
+        assert_eq!(spikes(&mut h), vec![(100, 0.5)]);
+        assert_eq!(h.engine.shared.plugin_latency(), 100, "everything is heard 100 frames later");
+    }
+
+    #[test]
+    fn the_aux_return_lines_up_with_the_direct_signal() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.insert(0, Box::new(Impulse));
+        h.send(Command::SetSend { track: 0, db: 0.0 });
+        h.send(Command::Insert { target: Target::Aux, slot: 0, node: lookahead() });
+        // Let the send level's smoother ramp up first (the impulse only
+        // fires once playing).
+        crate::clap::enter_audio_thread();
+        h.settle(2);
+        // The send is tapped before the extra delay; the direct path after
+        // it; the aux's plugin then brings the send back exactly in time.
+        assert_eq!(spikes(&mut h), vec![(100, 0.5)]);
+    }
+
+    #[test]
+    fn removing_the_slow_plugin_removes_the_compensation() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.send(Command::Insert { target: Target::Track(0), slot: 0, node: lookahead() });
+        let mut out = vec![0f32; 512 * 2];
+        h.engine.render(&mut out);
+        assert_eq!(h.engine.plugin_latency, 100);
+        h.send(Command::Remove { target: Target::Track(0), slot: 0 });
+        h.engine.render(&mut out);
+        assert_eq!(h.engine.plugin_latency, 0);
+    }
+
+    #[test]
+    fn recording_includes_the_plugin_delay() {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.add_track(1);
+        let mut rec = Rec::wire(&mut h, 2);
+        h.send(Command::Insert { target: Target::Track(1), slot: 0, node: lookahead() });
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::Seek { beat: 1.0 });
+        h.send(Command::Play);
+        crate::clap::enter_audio_thread();
+        let mut out = vec![0f32; 512 * 2];
+        rec.feed(512);
+        h.engine.render(&mut out);
+        let (ctrl, ..) = rec.drain();
+        // What you hear is 100 frames later than before, so what you play
+        // along belongs 100 frames earlier.
+        assert_eq!(begin_frame(&ctrl[0]), Some((1, 24_000 - 512 - 100)));
+    }
+
+
+    // ---- Step 2 exercise: the audio thread never allocates ----
+
+    /// Everything at once, through the real engine: if any feature
+    /// allocates or frees on the audio thread, this fails.
+    #[test]
+    fn the_audio_thread_never_allocates_with_every_feature_in_use() {
+        use crate::automation::{normalize, AutoTarget, AutomationSet, Envelope, Lane, VOLUME_INFO};
+        use crate::clip::{AudioClip, ClipList, ClipParams};
+        use crate::clap::{test_plugin, ClapNode, Instance};
+        use crate::loader::AudioData;
+        use crate::midi::{Note, Sequence};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut h = Harness::new(2);
+        let mut rec = Rec::wire(&mut h, 2);
+        for t in 0..4 {
+            h.add_track(t);
+        }
+        let node = |kind: &str, params: &[(usize, f32)]| -> Box<dyn Processor> {
+            let mut n = crate::nodes::make(kind).unwrap();
+            n.prepare(&INFO);
+            for &(p, v) in params {
+                n.set_param(p, v);
+            }
+            n
+        };
+        let insert = |h: &mut Harness, target: Target, slot: usize, n: Box<dyn Processor>| h.send(Command::Insert { target, slot, node: n });
+        let clips = |seed: f32| {
+            let data = Arc::new(AudioData { path: None, name: "a".into(), sample_rate: 44_100.0, channels: vec![vec![seed; 200_000], vec![-seed; 200_000]] });
+            let mut list = Vec::new();
+            for (i, start) in [0.0, 3.0, 5.5].into_iter().enumerate() {
+                let mut p = ClipParams::new(i as u32 + 1, start, 4.0);
+                p.fade_in_beats = 0.25;
+                p.fade_out_beats = 0.5;
+                p.offset_secs = 0.1 * i as f64;
+                list.push(AudioClip::new(data.clone(), p, &INFO));
+            }
+            Box::new(ClipList::new(list))
+        };
+        let bundle = crate::clap::tests::example_bundle();
+        let plugin = |id: &str| ClapNode::new(Instance::create(&bundle, id, &INFO).unwrap(), &INFO).unwrap();
+
+        // Track 0: audio clips, effects, a sidechain, a send, automation.
+        h.send(Command::SetClips { track: 0, clips: clips(0.2) });
+        insert(&mut h, Target::Track(0), 0, node("filter", &[(0, 4.0), (2, 4.0)]));
+        insert(&mut h, Target::Track(0), 1, node("comp", &[]));
+        insert(&mut h, Target::Track(0), 2, node("delay", &[(5, 1.0), (1, 0.5)]));
+        h.send(Command::SetSidechain { track: 0, source: Some(1) });
+        h.send(Command::SetSend { track: 0, db: -6.0 });
+        let freq = crate::nodes::make("filter").unwrap().param_info()[1];
+        let lanes = vec![
+            Lane::new(AutoTarget::Volume, VOLUME_INFO, Envelope::new(vec![(0.0, normalize(&VOLUME_INFO, 0.0)), (8.0, normalize(&VOLUME_INFO, -20.0))])),
+            Lane::new(AutoTarget::Node { slot: 0, param: 1 }, freq, Envelope::new(vec![(0.0, 0.2), (4.0, 0.9)])),
+        ];
+        h.send(Command::SetAutomation { track: 0, automation: Box::new(AutomationSet { lanes }) });
+        // Track 1: the synth, a sequence, effects, live MIDI.
+        let mut synth: Box<dyn Instrument> = Box::new(crate::synth::Synth::new());
+        synth.prepare(&INFO);
+        synth.set_param(6, 800.0);
+        synth.set_param(7, 3.0);
+        h.send(Command::SetInstrument { track: 1, instrument: Some(synth) });
+        h.send(Command::SetSequence { track: 1, sequence: Box::new(Sequence::build([(0.0, 16.0, &crate::session::demo_notes()[..])])) });
+        insert(&mut h, Target::Track(1), 0, node("eq", &[(1, 6.0), (3, -4.0)]));
+        insert(&mut h, Target::Track(1), 1, node("reverb", &[]));
+        h.send(Command::Arm { track: Some(1) });
+        // Track 2: CLAP plugins: an effect, an instrument, a lookahead.
+        h.send(Command::SetInstrument { track: 2, instrument: Some(Box::new(plugin(test_plugin::BEEP_ID))) });
+        let notes = [Note { start: 0.0, length: 0.4, pitch: 64, velocity: 100 }, Note { start: 1.0, length: 2.0, pitch: 67, velocity: 90 }];
+        h.send(Command::SetSequence { track: 2, sequence: Box::new(Sequence::build([(0.0, 8.0, &notes[..])])) });
+        insert(&mut h, Target::Track(2), 0, Box::new(plugin(test_plugin::GAIN_ID)));
+        insert(&mut h, Target::Track(2), 1, Box::new(plugin(test_plugin::LOOKAHEAD_ID)));
+        // Track 3: recording with monitoring and a punch range.
+        h.send(Command::SetRecordTrack { track: Some(3) });
+        h.send(Command::SetMonitor { on: true });
+        h.send(Command::SetPunch { range: Some((2.0, 6.0)) });
+        h.send(Command::SetDriftCorrection { corrector: Some(Box::new(DriftCorrector::new(65_536))) });
+        // Buses, the metronome, a loop.
+        insert(&mut h, Target::Aux, 0, node("reverb", &[(3, 1.0)]));
+        insert(&mut h, Target::Master, 0, node("comp", &[]));
+        insert(&mut h, Target::Master, 1, node("eq", &[]));
+        insert(&mut h, Target::Master, 2, node("click", &[]));
+        h.send(Command::SetLoop { range: Some((0.0, 8.0)) });
+        h.send(Command::Play);
+
+        crate::clap::enter_audio_thread();
+        let mut seed = 1u32;
+        for block in 0..400usize {
+            // The main thread's side of every callback: input arrives, live
+            // MIDI arrives, garbage is freed, and now and then the user edits.
+            rec.feed(512);
+            if block % 7 == 0 {
+                let at = h.engine.last_callback.unwrap_or_else(std::time::Instant::now);
+                for msg in [MidiMessage::NoteOn { note: 60 + (block % 12) as u8, velocity: 90 }, MidiMessage::ControlChange { controller: 64, value: (block % 2 * 127) as u8 }] {
+                    let _ = h.live_tx.push(LiveMidi { at, msg });
+                }
+            }
+            match block {
+                50 => h.send(Command::SetClips { track: 0, clips: clips(0.3) }), // swapped mid-play
+                90 => h.send(Command::SetTempo { bpm: 97.0 }),
+                120 => h.send(Command::Seek { beat: 3.25 }),
+                150 => h.send(Command::Stop),
+                160 => h.send(Command::Play),
+                200 => insert(&mut h, Target::Track(0), 2, node("delay", &[])), // replaces one
+                240 => h.send(Command::RemoveTrack { index: 2 }), // plugins and all
+                300 => h.send(Command::Arm { track: Some(0) }),
+                _ => {}
+            }
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let _ = h.tx.push(Command::SetParam { target: Target::Track(1), slot: 0, param: (seed % 7) as usize, value: (seed % 1000) as f32 / 100.0 });
+            }
+            // Odd callback sizes, so blocks split and windows vary.
+            let frames = [512, 300, 700, 64, 1024][block % 5];
+            let mut out = vec![0f32; frames * 2];
+            h.engine.render(&mut out);
+            while let Ok(g) = h._garbage.pop() {
+                drop(g); // freed here, on the "main thread", as the session does
+            }
+            let _ = rec.drain();
+        }
+        assert!(rec.shared.frames_in.load(Relaxed) > 0, "the input really was running");
+        assert_eq!(h.engine.shared.rt_violations(), 0, "the audio thread allocated or freed memory");
+    }
+
+    #[test]
+    fn the_check_catches_a_node_that_allocates() {
+        /// A badly written effect: a fresh Vec every block.
+        struct Careless;
+        impl Processor for Careless {
+            fn name(&self) -> &'static str { "careless" }
+            fn param_info(&self) -> &'static [crate::processor::ParamInfo] { &[] }
+            fn prepare(&mut self, _: &PrepareInfo) {}
+            fn set_param(&mut self, _: usize, _: f32) {}
+            fn process(&mut self, b: &mut AudioBuffer, _: &ProcessContext) {
+                let scratch: Vec<f32> = b.channel(0).to_vec(); // allocates!
+                std::hint::black_box(scratch);
+            }
+        }
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        h.insert(0, Box::new(Careless));
+        h.settle(2);
+        assert!(h.engine.shared.rt_violations() >= 20, "caught every block: {}", h.engine.shared.rt_violations());
+    }
+
+    // ---- Step 10 exercise: drift correction ----
+
+    /// Records for `callbacks` blocks from an input running `drift_ppm`
+    /// fast, delivered in 256-frame bursts. Returns (frames recorded,
+    /// frames rendered).
+    fn record_with_drift(correct: bool, drift_ppm: f64, callbacks: usize) -> (usize, usize) {
+        let mut h = Harness::new(2);
+        h.add_track(0);
+        let mut rec = Rec::wire(&mut h, 2);
+        if correct {
+            h.send(Command::SetDriftCorrection { corrector: Some(Box::new(DriftCorrector::new(65_536))) });
+        }
+        h.send(Command::SetRecordTrack { track: Some(0) });
+        h.send(Command::Play);
+        let (mut produced, mut delivered, mut recorded) = (0.0f64, 0usize, 0usize);
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..callbacks {
+            produced += 512.0 * (1.0 + drift_ppm * 1e-6);
+            let burst = (produced as usize - delivered) / 256 * 256;
+            rec.feed(burst);
+            delivered += burst;
+            h.engine.render(&mut out);
+            recorded += rec.drain().1.len();
+        }
+        (recorded, callbacks * 512)
+    }
+
+    #[test]
+    fn with_drift_correction_a_take_keeps_time_with_the_song() {
+        // About 3.5 minutes of a 100 ppm fast input.
+        let (uncorrected, rendered) = record_with_drift(false, 100.0, 20_000);
+        // 100 ppm of 10.24 M frames is ~1024 extra, less up to one 256-frame
+        // burst still in flight at the end.
+        assert!(uncorrected > rendered + 700, "without correction the take has extra frames: it drifts ({uncorrected} vs {rendered})");
+        let (corrected, rendered) = record_with_drift(true, 100.0, 20_000);
+        // Every frame of the take matches a rendered frame, one for one (the
+        // last partial chunk is still on its way to the disk writer).
+        assert!(rendered - corrected < 256, "{corrected} recorded for {rendered} rendered");
+    }
+
+    #[test]
+    fn drift_correction_reports_its_ratio() {
+        let mut h = Harness::new(2);
+        let mut rec = Rec::wire(&mut h, 2);
+        h.send(Command::SetDriftCorrection { corrector: Some(Box::new(DriftCorrector::new(65_536))) });
+        let mut out = vec![0f32; 512 * 2];
+        let (mut produced, mut delivered) = (0.0f64, 0usize);
+        for _ in 0..30_000 {
+            produced += 512.0 * (1.0 + 200e-6);
+            let burst = (produced as usize - delivered) / 256 * 256;
+            rec.feed(burst);
+            delivered += burst;
+            h.engine.render(&mut out);
+        }
+        let ppm = rec.shared.correction_ppm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000.0;
+        assert!(ppm > 50.0 && ppm < 400.0, "correcting toward +200 ppm: {ppm:.1}");
+        // Turning it off goes back to passing input straight through.
+        h.send(Command::SetDriftCorrection { corrector: None });
+        h.engine.render(&mut out);
+        assert!(h.engine.corrector.is_none());
     }
 }

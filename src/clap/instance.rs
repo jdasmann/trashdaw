@@ -7,9 +7,13 @@ use crate::processor::{Instrument, ParamInfo, ParamKind, PrepareInfo, Processor}
 use crate::transport::ProcessContext;
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::events::{
-    clap_event_header, clap_event_note, clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID,
-    CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE,
+    clap_event_header, clap_event_note, clap_event_param_value, clap_event_transport, clap_input_events, clap_output_events,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT,
+    CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE,
+    CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
 };
+use clap_sys::ext::latency::{clap_plugin_latency, CLAP_EXT_LATENCY};
+use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_EXT_AUDIO_PORTS};
 use clap_sys::ext::params::{clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED};
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
@@ -46,6 +50,12 @@ pub struct Instance {
     cpu: AtomicU32,
     /// The plugin returned an error from `process`: it's bypassed.
     pub failed: AtomicBool,
+    /// The watchdog bypassed it for being too slow (see `ClapNode::run`).
+    overloaded: AtomicBool,
+    overload_reported: AtomicBool,
+    /// How many frames late the plugin's output is (a look-ahead limiter,
+    /// a linear-phase EQ...). The mixer compensates for it.
+    pub latency: u32,
     /// A plugin instance may be in only one place in the engine at once.
     in_engine: AtomicBool,
     // The plugin holds pointers to `host` and runs code from `bundle`, so
@@ -160,6 +170,9 @@ impl Instance {
             destroy();
             return Err(format!("{} failed to activate", descriptor.name));
         }
+        // Latency may only be asked once active [main-thread & active].
+        let latency_ext = ext(CLAP_EXT_LATENCY) as *const clap_plugin_latency;
+        let latency = unsafe { latency_ext.as_ref().and_then(|l| l.get).map_or(0, |g| g(plugin)) };
         Ok(Arc::new(Instance {
             plugin,
             name: intern(&descriptor.name),
@@ -172,6 +185,9 @@ impl Instance {
             outputs,
             cpu: AtomicU32::new(0),
             failed: AtomicBool::new(false),
+            overloaded: AtomicBool::new(false),
+            overload_reported: AtomicBool::new(false),
+            latency,
             in_engine: AtomicBool::new(false),
             host,
             _bundle: bundle.clone(),
@@ -219,6 +235,15 @@ impl Instance {
             }
         }
         let mut log = self.host.take_log();
+        // The watchdog DECIDED on the audio thread; it's REPORTED here,
+        // because building a message allocates.
+        if self.is_overloaded() && !self.overload_reported.swap(true, Ordering::Relaxed) {
+            log.push(format!(
+                "{} used more than {:.0}% of the time budget for {WATCHDOG_BLOCKS} blocks in a row, so it was bypassed to stop the dropouts. Re-enable it in the inspector.",
+                self.name,
+                WATCHDOG_LIMIT * 100.0
+            ));
+        }
         if self.host.restart_requested.swap(false, Ordering::Relaxed) {
             log.push(format!("{} asked to be restarted, which isn't supported yet: remove and re-add it if it misbehaves", self.name));
         }
@@ -229,6 +254,16 @@ impl Instance {
     /// time budget went to this plugin.
     pub fn take_cpu(&self) -> f32 {
         f32::from_bits(self.cpu.swap(0, Ordering::Relaxed))
+    }
+
+    pub fn is_overloaded(&self) -> bool {
+        self.overloaded.load(Ordering::Relaxed)
+    }
+
+    /// Lets a plugin the watchdog bypassed play again.
+    pub fn reenable(&self) {
+        self.overload_reported.store(false, Ordering::Relaxed);
+        self.overloaded.store(false, Ordering::Relaxed);
     }
 
     pub fn in_engine(&self) -> bool {
@@ -298,6 +333,50 @@ enum Event {
 
 const MAX_EVENTS: usize = 1024;
 
+/// The watchdog: a plugin using more than this share of the block's time,
+/// for this many blocks in a row, is bypassed.
+pub const WATCHDOG_LIMIT: f32 = 0.8;
+pub const WATCHDOG_BLOCKS: u32 = 8;
+
+/// Beats or seconds as CLAP's 32.32 fixed-point numbers: exact for musical
+/// subdivisions, and free of the drift that repeatedly added floats have.
+fn fixed(x: f64, factor: i64) -> i64 {
+    (x * factor as f64).round() as i64
+}
+
+/// Where we are, for tempo-synced plugins (delays, arpeggiators, LFOs).
+fn transport_event(ctx: &ProcessContext) -> clap_event_transport {
+    use crate::transport::BEATS_PER_BAR;
+    let spb = ctx.samples_per_beat();
+    let beats = ctx.position as f64 / spb;
+    let secs_per_beat = 60.0 / ctx.tempo;
+    let mut flags = CLAP_TRANSPORT_HAS_TEMPO | CLAP_TRANSPORT_HAS_BEATS_TIMELINE | CLAP_TRANSPORT_HAS_SECONDS_TIMELINE | CLAP_TRANSPORT_HAS_TIME_SIGNATURE;
+    if ctx.playing {
+        flags |= CLAP_TRANSPORT_IS_PLAYING;
+    }
+    let (loop_start, loop_end) = ctx.loop_beats.unwrap_or((0.0, 0.0));
+    if ctx.loop_beats.is_some() {
+        flags |= CLAP_TRANSPORT_IS_LOOP_ACTIVE;
+    }
+    let bar = (beats / BEATS_PER_BAR).floor();
+    clap_event_transport {
+        header: header(std::mem::size_of::<clap_event_transport>(), 0, CLAP_EVENT_TRANSPORT),
+        flags,
+        song_pos_beats: fixed(beats, CLAP_BEATTIME_FACTOR),
+        song_pos_seconds: fixed(ctx.position as f64 / ctx.sample_rate, CLAP_SECTIME_FACTOR),
+        tempo: ctx.tempo,
+        tempo_inc: 0.0,
+        loop_start_beats: fixed(loop_start, CLAP_BEATTIME_FACTOR),
+        loop_end_beats: fixed(loop_end, CLAP_BEATTIME_FACTOR),
+        loop_start_seconds: fixed(loop_start * secs_per_beat, CLAP_SECTIME_FACTOR),
+        loop_end_seconds: fixed(loop_end * secs_per_beat, CLAP_SECTIME_FACTOR),
+        bar_start: fixed(bar * BEATS_PER_BAR, CLAP_BEATTIME_FACTOR),
+        bar_number: bar as i32,
+        tsig_num: BEATS_PER_BAR as u16,
+        tsig_denom: 4,
+    }
+}
+
 /// A plugin in the engine, as an effect (`Processor`) or as an instrument.
 pub struct ClapNode {
     inst: Arc<Instance>,
@@ -311,6 +390,8 @@ pub struct ClapNode {
     out_r: Vec<f32>,
     steady_time: i64,
     sample_rate: f64,
+    /// Blocks in a row over the watchdog's limit.
+    overruns: u32,
 }
 
 // SAFETY: the events hold raw pointers (null "cookies") that are never
@@ -335,6 +416,7 @@ impl ClapNode {
             out_r: vec![0.0; n],
             steady_time: 0,
             sample_rate: info.sample_rate as f64,
+            overruns: 0,
         })
     }
 
@@ -349,10 +431,13 @@ impl ClapNode {
     /// [audio-thread] Runs the plugin over the buffer's window. As an
     /// effect, its output replaces the buffer; as an instrument, it's
     /// added (like every other source on a track).
-    fn run(&mut self, buffer: &mut AudioBuffer, midi: &[MidiEvent], instrument: bool) {
+    fn run(&mut self, buffer: &mut AudioBuffer, ctx: &ProcessContext, midi: &[MidiEvent], instrument: bool) {
         let n = buffer.frames().min(self.out_l.len());
-        if n == 0 || self.inst.failed.load(Ordering::Relaxed) {
-            return; // a failed plugin is bypassed: the buffer passes through
+        // Bypassed: an effect passes the audio through untouched; an
+        // instrument adds nothing (silence: there's nothing to pass on).
+        if n == 0 || self.inst.failed.load(Ordering::Relaxed) || self.inst.is_overloaded() {
+            self.overruns = 0;
+            return;
         }
         let plugin = self.inst.plugin;
         if !self.started {
@@ -413,10 +498,11 @@ impl ClapNode {
         let mut output = clap_audio_buffer { data32: out_ptrs.as_mut_ptr(), data64: std::ptr::null_mut(), channel_count: self.inst.outputs, latency: 0, constant_mask: 0 };
         let in_events = clap_input_events { ctx: (&self.events as *const Vec<Event>) as *mut c_void, size: Some(events_size), get: Some(events_get) };
         let out_events = clap_output_events { ctx: std::ptr::null_mut(), try_push: Some(events_push) };
+        let transport = transport_event(ctx);
         let process = clap_process {
             steady_time: self.steady_time,
             frames_count: n as u32,
-            transport: std::ptr::null(), // no tempo/position info yet: an exercise
+            transport: &transport,
             audio_inputs: if self.inst.inputs > 0 { &input } else { std::ptr::null() },
             audio_outputs: &mut output,
             audio_inputs_count: (self.inst.inputs > 0) as u32,
@@ -433,6 +519,19 @@ impl ClapNode {
         let load = (start.elapsed().as_secs_f64() * self.sample_rate / n as f64) as f32;
         self.inst.cpu.fetch_max(load.to_bits(), Ordering::Relaxed);
         self.steady_time += n as i64;
+
+        // The watchdog DECIDES here, on the audio thread: only this thread
+        // knows how long each call took, and only it can act in time, on
+        // the very next block. A single slow block is forgiven (a plugin
+        // may allocate once, say); a run of them means dropouts.
+        if load > WATCHDOG_LIMIT {
+            self.overruns += 1;
+            if self.overruns >= WATCHDOG_BLOCKS {
+                self.inst.overloaded.store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.overruns = 0;
+        }
 
         if status == CLAP_PROCESS_ERROR {
             self.inst.failed.store(true, Ordering::Relaxed);
@@ -506,11 +605,14 @@ impl Processor for ClapNode {
     fn set_param(&mut self, id: usize, value: f32) {
         self.queue_param(id, value);
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, _ctx: &ProcessContext) {
-        self.run(buffer, &[], false);
+    fn process(&mut self, buffer: &mut AudioBuffer, ctx: &ProcessContext) {
+        self.run(buffer, ctx, &[], false);
     }
     fn stop(&mut self) {
         self.stop_processing();
+    }
+    fn latency(&self) -> u32 {
+        self.inst.latency
     }
 }
 
@@ -525,10 +627,13 @@ impl Instrument for ClapNode {
     fn set_param(&mut self, id: usize, value: f32) {
         self.queue_param(id, value);
     }
-    fn render(&mut self, buffer: &mut AudioBuffer, _ctx: &ProcessContext, events: &[MidiEvent]) {
-        self.run(buffer, events, true);
+    fn render(&mut self, buffer: &mut AudioBuffer, ctx: &ProcessContext, events: &[MidiEvent]) {
+        self.run(buffer, ctx, events, true);
     }
     fn stop(&mut self) {
         self.stop_processing();
+    }
+    fn latency(&self) -> u32 {
+        self.inst.latency
     }
 }
